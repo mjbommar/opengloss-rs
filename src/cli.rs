@@ -2,7 +2,7 @@ use std::cmp;
 use std::error::Error;
 
 use atty::Stream;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use opengloss_rs::LexemeIndex;
 use serde_json::json;
 use termimad::{FmtText, MadSkin, terminal_size};
@@ -43,11 +43,35 @@ enum LexemeCommand {
     },
     /// Search for lexemes that contain the provided substring.
     Search {
-        /// Substring to match anywhere within the lexeme.
+        /// Query text to search for.
         pattern: String,
         /// Maximum number of matches to return.
         #[arg(short, long, default_value_t = 10)]
         limit: usize,
+        /// Search mode (fuzzy uses RapidFuzz scoring; substring scans lexeme forms only).
+        #[arg(long, value_enum, default_value_t = SearchMode::Fuzzy)]
+        mode: SearchMode,
+        /// Fields to search; omit to use defaults (word + definitions).
+        #[arg(long = "field", value_enum)]
+        fields: Vec<SearchField>,
+        /// Weight for matching against the lexeme word itself.
+        #[arg(long, default_value_t = 3.0)]
+        weight_word: f32,
+        /// Weight for definitions and senses.
+        #[arg(long, default_value_t = 2.0)]
+        weight_definitions: f32,
+        /// Weight for synonyms list.
+        #[arg(long, default_value_t = 1.0)]
+        weight_synonyms: f32,
+        /// Weight for the entry text body.
+        #[arg(long, default_value_t = 1.5)]
+        weight_text: f32,
+        /// Weight for the encyclopedia article.
+        #[arg(long, default_value_t = 1.5)]
+        weight_encyclopedia: f32,
+        /// Minimum normalized score (0-1) before emitting a hit.
+        #[arg(long, default_value_t = 0.15)]
+        min_score: f32,
     },
     /// Show the full entry for a lexeme.
     Show {
@@ -66,9 +90,30 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         Command::Lexeme(LexemeCommand::Prefix { prefix, limit }) => {
             handle_prefix(prefix, limit, cli.json)
         }
-        Command::Lexeme(LexemeCommand::Search { pattern, limit }) => {
-            handle_search(pattern, limit, cli.json)
-        }
+        Command::Lexeme(LexemeCommand::Search {
+            pattern,
+            limit,
+            mode,
+            fields,
+            weight_word,
+            weight_definitions,
+            weight_synonyms,
+            weight_text,
+            weight_encyclopedia,
+            min_score,
+        }) => handle_search(
+            pattern,
+            limit,
+            cli.json,
+            mode,
+            fields,
+            weight_word,
+            weight_definitions,
+            weight_synonyms,
+            weight_text,
+            weight_encyclopedia,
+            min_score,
+        ),
         Command::Lexeme(LexemeCommand::Show { query, by_id }) => {
             handle_show(query, by_id, cli.json)
         }
@@ -115,27 +160,90 @@ fn handle_prefix(prefix: String, limit: usize, as_json: bool) -> Result<(), Box<
     Ok(())
 }
 
-fn handle_search(pattern: String, limit: usize, as_json: bool) -> Result<(), Box<dyn Error>> {
+fn handle_search(
+    pattern: String,
+    limit: usize,
+    as_json: bool,
+    mode: SearchMode,
+    fields: Vec<SearchField>,
+    weight_word: f32,
+    weight_definitions: f32,
+    weight_synonyms: f32,
+    weight_text: f32,
+    weight_encyclopedia: f32,
+    min_score: f32,
+) -> Result<(), Box<dyn Error>> {
     if pattern.trim().is_empty() {
         return Err("Search pattern cannot be empty".into());
     }
-    let limit = cmp::max(1, limit);
-    let matches = LexemeIndex::search_contains(&pattern, limit);
-
-    if as_json {
-        let payload = json!({
-            "mode": "substring",
-            "pattern": pattern,
-            "limit": limit,
-            "results": matches.iter().map(|(word, id)| {
-                json!({"word": word, "lexeme_id": id})
-            }).collect::<Vec<_>>(),
-        });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-    } else {
-        print_search_table(&pattern, &matches);
+    match mode {
+        SearchMode::Substring => {
+            let limit = cmp::max(1, limit);
+            let matches = LexemeIndex::search_contains(&pattern, limit);
+            if as_json {
+                let payload = json!({
+                    "mode": "substring",
+                    "pattern": pattern,
+                    "limit": limit,
+                    "results": matches.iter().map(|(word, id)| {
+                        json!({"word": word, "lexeme_id": id})
+                    }).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                print_search_table(&pattern, &matches);
+            }
+            Ok(())
+        }
+        SearchMode::Fuzzy => {
+            let selected = if fields.is_empty() {
+                vec![SearchField::Word, SearchField::Definitions]
+            } else {
+                fields
+            };
+            let mut config = opengloss_rs::SearchConfig {
+                weight_word,
+                weight_definitions,
+                weight_synonyms,
+                weight_text,
+                weight_encyclopedia,
+                min_score,
+            };
+            apply_field_filter(&mut config, &selected);
+            if config.total_weight() <= 0.0 {
+                return Err("All search weights are zero; nothing to search".into());
+            }
+            let limit = cmp::max(1, limit);
+            let results = LexemeIndex::search_fuzzy(&pattern, &config, limit);
+            if as_json {
+                let payload = json!({
+                    "mode": "fuzzy",
+                    "pattern": pattern,
+                    "limit": limit,
+                    "config": {
+                        "weight_word": config.weight_word,
+                        "weight_definitions": config.weight_definitions,
+                        "weight_synonyms": config.weight_synonyms,
+                        "weight_text": config.weight_text,
+                        "weight_encyclopedia": config.weight_encyclopedia,
+                        "min_score": config.min_score,
+                        "fields": selected.iter().map(|f| f.to_string()).collect::<Vec<_>>(),
+                    },
+                    "results": results.iter().map(|row| {
+                        json!({
+                            "lexeme_id": row.lexeme_id,
+                            "word": row.word,
+                            "score": row.score,
+                        })
+                    }).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                print_fuzzy_table(&pattern, &results);
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 fn handle_show(query: String, by_id: bool, as_json: bool) -> Result<(), Box<dyn Error>> {
@@ -214,6 +322,43 @@ fn print_search_table(pattern: &str, rows: &[(String, u32)]) {
     println!("{:-<width$}  {}", "", "----------", width = width);
     for (word, id) in rows {
         println!("{:<width$}  {}", word, id, width = width);
+    }
+}
+
+fn print_fuzzy_table(pattern: &str, rows: &[opengloss_rs::SearchResult]) {
+    if rows.is_empty() {
+        println!("No fuzzy matches found for \"{pattern}\".");
+        return;
+    }
+    let width = rows
+        .iter()
+        .map(|row| row.word.len())
+        .max()
+        .unwrap_or(pattern.len())
+        .max("WORD".len());
+    println!("Fuzzy matches for \"{pattern}\":");
+    println!(
+        "{:<width$}  {:<8}  {}",
+        "WORD",
+        "SCORE",
+        "LEXEME_ID",
+        width = width
+    );
+    println!(
+        "{:-<width$}  {:<8}  {}",
+        "",
+        "--------",
+        "----------",
+        width = width
+    );
+    for row in rows {
+        println!(
+            "{:<width$}  {:<8.3}  {}",
+            row.word,
+            row.score,
+            row.lexeme_id,
+            width = width
+        );
     }
 }
 
@@ -365,6 +510,24 @@ where
     }
 }
 
+fn apply_field_filter(config: &mut opengloss_rs::SearchConfig, fields: &[SearchField]) {
+    if !fields.contains(&SearchField::Word) {
+        config.weight_word = 0.0;
+    }
+    if !fields.contains(&SearchField::Definitions) {
+        config.weight_definitions = 0.0;
+    }
+    if !fields.contains(&SearchField::Synonyms) {
+        config.weight_synonyms = 0.0;
+    }
+    if !fields.contains(&SearchField::Text) {
+        config.weight_text = 0.0;
+    }
+    if !fields.contains(&SearchField::Encyclopedia) {
+        config.weight_encyclopedia = 0.0;
+    }
+}
+
 fn stdout_is_tty() -> bool {
     atty::is(Stream::Stdout)
 }
@@ -390,5 +553,32 @@ fn render_markdown_block(title: &str, body: &str) {
         println!("{formatted}");
     } else {
         println!("{trimmed}");
+    }
+}
+#[derive(Copy, Clone, Debug, ValueEnum, Eq, PartialEq)]
+enum SearchMode {
+    Fuzzy,
+    Substring,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, Eq, PartialEq, Hash)]
+enum SearchField {
+    Word,
+    Definitions,
+    Synonyms,
+    Text,
+    Encyclopedia,
+}
+
+impl std::fmt::Display for SearchField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            SearchField::Word => "word",
+            SearchField::Definitions => "definitions",
+            SearchField::Synonyms => "synonyms",
+            SearchField::Text => "text",
+            SearchField::Encyclopedia => "encyclopedia",
+        };
+        write!(f, "{label}")
     }
 }

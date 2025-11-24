@@ -558,11 +558,7 @@ where
     Range::new(start, target.len() as u32 - start)
 }
 
-fn push_neighbor_refs<'a, I>(
-    lookup: &HashMap<String, u32>,
-    target: &mut Vec<u32>,
-    iter: I,
-) -> Range
+fn push_neighbor_refs<'a, I>(lookup: &HashMap<String, u32>, target: &mut Vec<u32>, iter: I) -> Range
 where
     I: IntoIterator<Item = &'a String>,
 {

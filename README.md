@@ -41,11 +41,26 @@ When enabled, the CLI provides rich output or JSON via `--json`:
 ```bash
 cargo run -- lexeme get 3d "a b c labels"
 cargo run -- lexeme prefix geo --limit 5
-cargo run -- lexeme search bio --limit 10
+cargo run -- lexeme search biodegradable --mode fuzzy --field word --field definitions
 cargo run -- --json lexeme prefix bio
 cargo run -- lexeme show 3d
 cargo run -- --json lexeme show 42 --by-id
 ```
+
+### Weighted search
+
+`lexeme search` defaults to a fuzzy RapidFuzz-backed ranking that blends matches across the word,
+definitions, synonyms, entry text, and encyclopedia content. You can toggle fields or adjust their
+weights directly:
+
+```bash
+# Focus on encyclopedia matches
+cargo run -- lexeme search "gravitation" --field encyclopedia --weight-encyclopedia 3.5
+# Fall back to substring-only matching across lexeme forms
+cargo run -- lexeme search bio --mode substring
+```
+
+Use `cargo run -- lexeme search --help` to see all knobs (field list, per-field weights, min score).
 
 Example JSON output:
 
@@ -67,17 +82,26 @@ cargo run -- --json lexeme get sphere
 - A second build artifact (`opengloss_data.rkyv.zst`) packs the entry metadata, parts of speech,
   senses, and aggregated synonym/antonym/example lists. It is Zstd-compressed during build so the
   binary stays manageable, then decompressed/aligned once at runtime for zero-copy access.
-- `LexemeIndex` in `src/lib.rs` exposes exact-match (`get`), prefix (`prefix`), and entry
--  resolution helpers (`entry_by_word`, `entry_by_id`), plus a substring search helper
-  (`search_contains`) used by the CLI `lexeme search` command.
-- All short strings (lexemes, relation labels, etc.) are stored as Zstd-compressed blobs inside the
-  packed string arena; they are decompressed lazily and cached in-process, which trims the initial
+- `LexemeIndex` in `src/lib.rs` exposes exact-match (`get`), prefix (`prefix`), substring
+  (`search_contains`), and weighted fuzzy search (`search_fuzzy`) helpers, plus entry resolution
+  helpers (`entry_by_word`, `entry_by_id`).
+- All short strings (lexemes, relation labels, etc.) are stored as lazily decompressed,
+  Zstd-compressed blobs inside the packed string arena; the first access inflates them into a cache,
+  trimming the initial
   RSS while keeping hot strings accessible as `&'static str`.
 - Long-form entry text and encyclopedia prose are placed in a compressed chunk store during the
   build step, so the binary still carries the full content while only decompressing paragraphs on
   demand.
 - Neighbor relations (synonyms, antonyms, hypernyms, hyponyms) are resolved to lexeme IDs ahead of
   time, enabling fast lookups/graph traversals without repeated string matching.
+
+## Search scoring
+
+[RapidFuzz](https://docs.rs/rapidfuzz) powers the fuzzy search API (`fuzz::ratio` at present). Each
+lexeme accumulates a weighted average across the enabled fields, and the normalized score (0–1) must
+clear the `min_score` threshold (default `0.15`) to appear in the results. Setting a field’s weight
+to zero effectively disables it, allowing you to experiment with Solr-style relevance tuning directly
+from the CLI.
 
 ## Performance snapshot
 

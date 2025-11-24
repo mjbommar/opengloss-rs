@@ -8,8 +8,13 @@ use fst::Automaton;
 use fst::automaton::Str;
 use fst::{IntoStreamer, Map, Streamer};
 use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use rapidfuzz::fuzz;
+use rayon::prelude::*;
 use rkyv::access_unchecked;
 use rkyv::util::AlignedVec;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::io::{Cursor, Read};
 use std::str;
 use std::sync::OnceLock;
@@ -32,6 +37,10 @@ static STRING_CACHE: Lazy<Vec<OnceLock<&'static str>>> = Lazy::new(|| {
     let len = data_store().strings.len();
     (0..len).map(|_| OnceLock::new()).collect()
 });
+static SUBSTRING_CACHE: Lazy<Mutex<lru::LruCache<String, Vec<(String, u32)>>>> =
+    Lazy::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(64).unwrap())));
+static FUZZY_CACHE: Lazy<Mutex<lru::LruCache<(String, SearchConfig, usize), Vec<SearchResult>>>> =
+    Lazy::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(32).unwrap())));
 
 /// Read-only access to the lexeme trie.
 pub struct LexemeIndex;
@@ -62,10 +71,17 @@ impl LexemeIndex {
         if pattern.is_empty() {
             return Vec::new();
         }
+        {
+            let mut cache = SUBSTRING_CACHE.lock();
+            if let Some(hit) = cache.get(pattern) {
+                return hit.iter().take(limit).cloned().collect();
+            }
+        }
+
         let mut stream = LEXEME_MAP.stream();
         let mut results = Vec::new();
         while let Some((key, value)) = stream.next() {
-            if let Ok(word) = str::from_utf8(key) {
+            if let Ok(word) = std::str::from_utf8(key) {
                 if word.contains(pattern) {
                     results.push((word.to_owned(), value as u32));
                     if results.len() >= limit {
@@ -74,6 +90,61 @@ impl LexemeIndex {
                 }
             }
         }
+
+        let mut cache = SUBSTRING_CACHE.lock();
+        cache.put(pattern.to_owned(), results.clone());
+        results
+    }
+
+    /// Performs a weighted fuzzy search over all entries.
+    pub fn search_fuzzy(query: &str, config: &SearchConfig, limit: usize) -> Vec<SearchResult> {
+        if query.trim().is_empty() || config.total_weight() <= 0.0 {
+            return Vec::new();
+        }
+        let store = data_store();
+        let limit = limit.max(1);
+        let config = config.clone();
+
+        let heap = store
+            .entries
+            .par_iter()
+            .filter_map(|entry| {
+                score_entry(query, store, entry, &config).and_then(|score| {
+                    if score < config.min_score {
+                        None
+                    } else {
+                        let word = store.string_from_archived(entry.word).to_owned();
+                        Some(RankedResult {
+                            score,
+                            lexeme_id: entry.lexeme_id.to_native(),
+                            word,
+                        })
+                    }
+                })
+            })
+            .fold(
+                || BinaryHeap::new(),
+                |mut heap, item| {
+                    push_ranked(&mut heap, item, limit);
+                    heap
+                },
+            )
+            .reduce(
+                || BinaryHeap::new(),
+                |mut left, mut right| {
+                    if left.len() < right.len() {
+                        std::mem::swap(&mut left, &mut right);
+                    }
+                    for item in right.drain() {
+                        push_ranked(&mut left, item, limit);
+                    }
+                    left
+                },
+            );
+
+        let results = drain_heap(heap);
+        let mut cache = FUZZY_CACHE.lock();
+        cache.put((query.to_owned(), config.clone(), limit), results.clone());
         results
     }
 
@@ -286,6 +357,70 @@ impl<'a> LexemeEntry<'a> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SearchConfig {
+    pub weight_word: f32,
+    pub weight_definitions: f32,
+    pub weight_synonyms: f32,
+    pub weight_text: f32,
+    pub weight_encyclopedia: f32,
+    pub min_score: f32,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            weight_word: 3.0,
+            weight_definitions: 2.0,
+            weight_synonyms: 1.0,
+            weight_text: 1.5,
+            weight_encyclopedia: 1.5,
+            min_score: 0.15,
+        }
+    }
+}
+
+impl SearchConfig {
+    pub fn total_weight(&self) -> f32 {
+        self.weight_word
+            + self.weight_definitions
+            + self.weight_synonyms
+            + self.weight_text
+            + self.weight_encyclopedia
+    }
+}
+
+impl PartialEq for SearchConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.weight_word.to_bits() == other.weight_word.to_bits()
+            && self.weight_definitions.to_bits() == other.weight_definitions.to_bits()
+            && self.weight_synonyms.to_bits() == other.weight_synonyms.to_bits()
+            && self.weight_text.to_bits() == other.weight_text.to_bits()
+            && self.weight_encyclopedia.to_bits() == other.weight_encyclopedia.to_bits()
+            && self.min_score.to_bits() == other.min_score.to_bits()
+    }
+}
+
+impl Eq for SearchConfig {}
+
+impl std::hash::Hash for SearchConfig {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.weight_word.to_bits().hash(state);
+        self.weight_definitions.to_bits().hash(state);
+        self.weight_synonyms.to_bits().hash(state);
+        self.weight_text.to_bits().hash(state);
+        self.weight_encyclopedia.to_bits().hash(state);
+        self.min_score.to_bits().hash(state);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub lexeme_id: u32,
+    pub word: String,
+    pub score: f32,
+}
+
 pub struct SenseIter<'a> {
     store: &'a ArchivedDataStore,
     senses: &'a [ArchivedSenseRecord],
@@ -452,5 +587,146 @@ impl ArchivedCompressedTextStore {
 impl ArchivedDataStore {
     fn decompress_long_text(&self, id: ArchivedTextId) -> String {
         self.long_texts.decompress(id)
+    }
+}
+
+#[derive(Clone)]
+struct RankedResult {
+    score: f32,
+    lexeme_id: u32,
+    word: String,
+}
+
+impl Eq for RankedResult {}
+
+impl PartialEq for RankedResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.eq(&other.score)
+    }
+}
+
+impl Ord for RankedResult {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .partial_cmp(&other.score)
+            .unwrap_or(Ordering::Equal)
+            .reverse()
+            .then_with(|| self.lexeme_id.cmp(&other.lexeme_id).reverse())
+    }
+}
+
+impl PartialOrd for RankedResult {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn push_ranked(heap: &mut BinaryHeap<RankedResult>, item: RankedResult, limit: usize) {
+    if heap.len() < limit {
+        heap.push(item);
+    } else if let Some(mut peek) = heap.peek_mut() {
+        if item.score > peek.score {
+            *peek = item;
+        }
+    }
+}
+
+fn drain_heap(mut heap: BinaryHeap<RankedResult>) -> Vec<SearchResult> {
+    let mut out = Vec::with_capacity(heap.len());
+    while let Some(item) = heap.pop() {
+        out.push(SearchResult {
+            lexeme_id: item.lexeme_id,
+            word: item.word,
+            score: item.score,
+        });
+    }
+    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    out
+}
+
+fn score_entry(
+    query: &str,
+    store: &ArchivedDataStore,
+    entry: &ArchivedEntryRecord,
+    config: &SearchConfig,
+) -> Option<f32> {
+    let mut total_weight = 0.0;
+    let mut accum = 0.0;
+
+    if config.weight_word > 0.0 {
+        let word = store.string_from_archived(entry.word);
+        let s = fuzzy_score(query, word);
+        total_weight += config.weight_word;
+        accum += s * config.weight_word;
+    }
+
+    if config.weight_definitions > 0.0 {
+        let s = best_range_score(
+            query,
+            store,
+            &entry.all_definitions,
+            store.entry_all_definitions.as_slice(),
+        );
+        total_weight += config.weight_definitions;
+        accum += s * config.weight_definitions;
+    }
+
+    if config.weight_synonyms > 0.0 {
+        let s = best_range_score(
+            query,
+            store,
+            &entry.all_synonyms,
+            store.entry_all_synonyms.as_slice(),
+        );
+        total_weight += config.weight_synonyms;
+        accum += s * config.weight_synonyms;
+    }
+
+    if config.weight_text > 0.0 {
+        if let Some(text_id) = entry.text.as_ref() {
+            let text = store.decompress_long_text(*text_id);
+            let s = fuzzy_score(query, &text);
+            total_weight += config.weight_text;
+            accum += s * config.weight_text;
+        }
+    }
+
+    if config.weight_encyclopedia > 0.0 {
+        if let Some(enc_id) = entry.encyclopedia_entry.as_ref() {
+            let text = store.decompress_long_text(*enc_id);
+            let s = fuzzy_score(query, &text);
+            total_weight += config.weight_encyclopedia;
+            accum += s * config.weight_encyclopedia;
+        }
+    }
+
+    if total_weight > 0.0 {
+        Some(accum / total_weight)
+    } else {
+        None
+    }
+}
+
+fn best_range_score(
+    query: &str,
+    store: &ArchivedDataStore,
+    range: &ArchivedRange,
+    bucket: &[ArchivedStringId],
+) -> f32 {
+    let mut best = 0.0;
+    for value in string_iter(store, range, bucket) {
+        let s = fuzzy_score(query, value);
+        if s > best {
+            best = s;
+        }
+    }
+    best
+}
+
+fn fuzzy_score(query: &str, value: &str) -> f32 {
+    if value.is_empty() {
+        0.0
+    } else {
+        fuzz::ratio(query.chars(), value.chars()) as f32
     }
 }
