@@ -1,9 +1,11 @@
 use std::cmp;
 use std::error::Error;
 
+use atty::Stream;
 use clap::{Parser, Subcommand};
 use opengloss_rs::LexemeIndex;
 use serde_json::json;
+use termimad::{FmtText, MadSkin, terminal_size};
 
 #[derive(Parser, Debug)]
 #[command(name = "opengloss-rs", about = "Explore OpenGloss data", version)]
@@ -224,13 +226,7 @@ fn print_entry(entry: &opengloss_rs::LexemeEntry<'_>) {
     }
 
     if let Some(text) = entry.text() {
-        let (preview, truncated) = truncate_text(&text, 600);
-        println!(
-            "\nEntry Text ({} chars){}",
-            text.len(),
-            if truncated { " [truncated]" } else { "" }
-        );
-        println!("{preview}");
+        render_markdown_block("Entry Text", &text);
     }
 
     if let Some(summary) = entry.etymology_summary() {
@@ -238,13 +234,7 @@ fn print_entry(entry: &opengloss_rs::LexemeEntry<'_>) {
         println!("{summary}");
     }
     if let Some(encyclopedia) = entry.encyclopedia_entry() {
-        let (preview, truncated) = truncate_text(&encyclopedia, 400);
-        println!(
-            "\nEncyclopedia Entry ({} chars){}",
-            encyclopedia.len(),
-            if truncated { " [truncated]" } else { "" }
-        );
-        println!("{preview}");
+        render_markdown_block("Encyclopedia Entry", &encyclopedia);
     }
 
     println!("\nSenses:");
@@ -268,18 +258,6 @@ fn print_entry(entry: &opengloss_rs::LexemeEntry<'_>) {
     }
 }
 
-fn truncate_text(text: &str, limit: usize) -> (&str, bool) {
-    if text.len() <= limit {
-        (text, false)
-    } else {
-        let mut end = limit;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        (&text[..end], true)
-    }
-}
-
 fn format_list(items: Vec<&str>, limit: usize) -> Option<String> {
     if items.is_empty() {
         return None;
@@ -295,4 +273,32 @@ fn format_list(items: Vec<&str>, limit: usize) -> Option<String> {
         text.push_str(", …");
     }
     Some(text)
+}
+
+fn stdout_is_tty() -> bool {
+    atty::is(Stream::Stdout)
+}
+
+fn markdown_width() -> usize {
+    let (width, _) = terminal_size();
+    width.max(60) as usize
+}
+
+fn markdown_skin() -> MadSkin {
+    MadSkin::default()
+}
+
+fn render_markdown_block(title: &str, body: &str) {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    println!("\n{title}:");
+    if stdout_is_tty() {
+        let skin = markdown_skin();
+        let formatted = FmtText::from(&skin, trimmed, Some(markdown_width()));
+        println!("{formatted}");
+    } else {
+        println!("{trimmed}");
+    }
 }
