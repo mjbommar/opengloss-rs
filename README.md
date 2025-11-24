@@ -41,6 +41,7 @@ When enabled, the CLI provides rich output or JSON via `--json`:
 ```bash
 cargo run -- lexeme get 3d "a b c labels"
 cargo run -- lexeme prefix geo --limit 5
+cargo run -- lexeme search bio --limit 10
 cargo run -- --json lexeme prefix bio
 cargo run -- lexeme show 3d
 cargo run -- --json lexeme show 42 --by-id
@@ -67,12 +68,16 @@ cargo run -- --json lexeme get sphere
   senses, and aggregated synonym/antonym/example lists. It is Zstd-compressed during build so the
   binary stays manageable, then decompressed/aligned once at runtime for zero-copy access.
 - `LexemeIndex` in `src/lib.rs` exposes exact-match (`get`), prefix (`prefix`), and entry
-  resolution helpers (`entry_by_word`, `entry_by_id`).
-- All short strings (lexemes, relation labels, etc.) are interned into a packed UTF-8 blob so they
-  can be accessed zero-copy without keeping separate heap allocations alive.
+-  resolution helpers (`entry_by_word`, `entry_by_id`), plus a substring search helper
+  (`search_contains`) used by the CLI `lexeme search` command.
+- All short strings (lexemes, relation labels, etc.) are stored as Zstd-compressed blobs inside the
+  packed string arena; they are decompressed lazily and cached in-process, which trims the initial
+  RSS while keeping hot strings accessible as `&'static str`.
 - Long-form entry text and encyclopedia prose are placed in a compressed chunk store during the
   build step, so the binary still carries the full content while only decompressing paragraphs on
   demand.
+- Neighbor relations (synonyms, antonyms, hypernyms, hyponyms) are resolved to lexeme IDs ahead of
+  time, enabling fast lookups/graph traversals without repeated string matching.
 
 ## Performance snapshot
 

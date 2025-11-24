@@ -2,7 +2,7 @@ mod data;
 
 use data::{
     ArchivedCompressedTextStore, ArchivedDataStore, ArchivedEntryRecord, ArchivedPackedStrings,
-    ArchivedRange, ArchivedSenseRecord, ArchivedStringId, ArchivedTextId,
+    ArchivedRange, ArchivedSenseRecord, ArchivedStringId, ArchivedTextId, ArchivedU32,
 };
 use fst::Automaton;
 use fst::automaton::Str;
@@ -12,6 +12,7 @@ use rkyv::access_unchecked;
 use rkyv::util::AlignedVec;
 use std::io::{Cursor, Read};
 use std::str;
+use std::sync::OnceLock;
 use zstd::stream::{Decoder as ZstdDecoder, decode_all};
 
 static LEXEME_FST_BYTES: &[u8] = include_bytes!(env!("LEXEME_FST"));
@@ -27,6 +28,10 @@ static DATA_SLICE: Lazy<&'static AlignedVec> = Lazy::new(|| {
 });
 static DATA_STORE: Lazy<&'static ArchivedDataStore> =
     Lazy::new(|| unsafe { access_unchecked::<ArchivedDataStore>(DATA_SLICE.as_slice()) });
+static STRING_CACHE: Lazy<Vec<OnceLock<&'static str>>> = Lazy::new(|| {
+    let len = data_store().strings.len();
+    (0..len).map(|_| OnceLock::new()).collect()
+});
 
 /// Read-only access to the lexeme trie.
 pub struct LexemeIndex;
@@ -52,6 +57,26 @@ impl LexemeIndex {
         results
     }
 
+    /// Performs a substring search over all lexemes.
+    pub fn search_contains(pattern: &str, limit: usize) -> Vec<(String, u32)> {
+        if pattern.is_empty() {
+            return Vec::new();
+        }
+        let mut stream = LEXEME_MAP.stream();
+        let mut results = Vec::new();
+        while let Some((key, value)) = stream.next() {
+            if let Ok(word) = str::from_utf8(key) {
+                if word.contains(pattern) {
+                    results.push((word.to_owned(), value as u32));
+                    if results.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        results
+    }
+
     /// Returns the lexeme entry for the given ID, if available.
     pub fn entry_by_id(lexeme_id: u32) -> Option<LexemeEntry<'static>> {
         data_store()
@@ -71,6 +96,10 @@ impl LexemeIndex {
 
 fn data_store() -> &'static ArchivedDataStore {
     *DATA_STORE
+}
+
+fn string_cache() -> &'static [OnceLock<&'static str>] {
+    STRING_CACHE.as_slice()
 }
 
 pub struct LexemeEntry<'a> {
@@ -227,6 +256,34 @@ impl<'a> LexemeEntry<'a> {
             self.store.entry_all_examples.as_slice(),
         )
     }
+
+    pub fn synonym_neighbor_ids(&'a self) -> impl Iterator<Item = u32> + 'a {
+        id_iter(
+            &self.entry.synonym_neighbors,
+            self.store.entry_synonym_neighbors.as_slice(),
+        )
+    }
+
+    pub fn antonym_neighbor_ids(&'a self) -> impl Iterator<Item = u32> + 'a {
+        id_iter(
+            &self.entry.antonym_neighbors,
+            self.store.entry_antonym_neighbors.as_slice(),
+        )
+    }
+
+    pub fn hypernym_neighbor_ids(&'a self) -> impl Iterator<Item = u32> + 'a {
+        id_iter(
+            &self.entry.hypernym_neighbors,
+            self.store.entry_hypernym_neighbors.as_slice(),
+        )
+    }
+
+    pub fn hyponym_neighbor_ids(&'a self) -> impl Iterator<Item = u32> + 'a {
+        id_iter(
+            &self.entry.hyponym_neighbors,
+            self.store.entry_hyponym_neighbors.as_slice(),
+        )
+    }
 }
 
 pub struct SenseIter<'a> {
@@ -329,6 +386,14 @@ fn string_iter<'a>(
     slice.iter().map(move |id| store.string_from_archived(*id))
 }
 
+fn id_iter<'a>(
+    range: &'a ArchivedRange,
+    bucket: &'a [ArchivedU32],
+) -> impl Iterator<Item = u32> + 'a {
+    let slice = range_slice(bucket, range);
+    slice.iter().map(|id| id.to_native())
+}
+
 fn range_slice<'a, T>(data: &'a [T], range: &'a ArchivedRange) -> &'a [T] {
     let start = range.start.to_native() as usize;
     let len = range.len.to_native() as usize;
@@ -341,18 +406,30 @@ trait StoreStrings {
 
 impl StoreStrings for ArchivedDataStore {
     fn string_from_archived(&self, id: ArchivedStringId) -> &str {
-        self.strings.get(id)
+        let idx = id.to_native() as usize;
+        string_cache()[idx].get_or_init(|| {
+            let owned = self.strings.decompress(idx);
+            Box::leak(owned.into_boxed_str())
+        })
     }
 }
 
 impl ArchivedPackedStrings {
-    fn get(&self, id: ArchivedStringId) -> &str {
-        let idx = id.to_native() as usize;
+    fn len(&self) -> usize {
+        self.offsets.as_slice().len()
+    }
+
+    fn compressed_slice(&self, idx: usize) -> &[u8] {
         let start = self.offsets.as_slice()[idx].to_native() as usize;
         let len = self.lengths.as_slice()[idx].to_native() as usize;
         let data = self.data.as_slice();
-        let bytes = &data[start..start + len];
-        str::from_utf8(bytes).expect("stored string data is valid UTF-8")
+        &data[start..start + len]
+    }
+
+    fn decompress(&self, idx: usize) -> String {
+        let bytes = self.compressed_slice(idx);
+        let decoded = decode_all(Cursor::new(bytes)).expect("string chunk decompresses");
+        String::from_utf8(decoded).expect("string chunk valid UTF-8")
     }
 }
 

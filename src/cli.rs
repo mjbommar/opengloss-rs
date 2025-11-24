@@ -41,6 +41,14 @@ enum LexemeCommand {
         #[arg(short, long, default_value_t = 10)]
         limit: usize,
     },
+    /// Search for lexemes that contain the provided substring.
+    Search {
+        /// Substring to match anywhere within the lexeme.
+        pattern: String,
+        /// Maximum number of matches to return.
+        #[arg(short, long, default_value_t = 10)]
+        limit: usize,
+    },
     /// Show the full entry for a lexeme.
     Show {
         /// Word or lexeme ID to display.
@@ -57,6 +65,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         Command::Lexeme(LexemeCommand::Get { words }) => handle_get(words, cli.json),
         Command::Lexeme(LexemeCommand::Prefix { prefix, limit }) => {
             handle_prefix(prefix, limit, cli.json)
+        }
+        Command::Lexeme(LexemeCommand::Search { pattern, limit }) => {
+            handle_search(pattern, limit, cli.json)
         }
         Command::Lexeme(LexemeCommand::Show { query, by_id }) => {
             handle_show(query, by_id, cli.json)
@@ -100,6 +111,29 @@ fn handle_prefix(prefix: String, limit: usize, as_json: bool) -> Result<(), Box<
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         print_prefix_table(&prefix, &matches);
+    }
+    Ok(())
+}
+
+fn handle_search(pattern: String, limit: usize, as_json: bool) -> Result<(), Box<dyn Error>> {
+    if pattern.trim().is_empty() {
+        return Err("Search pattern cannot be empty".into());
+    }
+    let limit = cmp::max(1, limit);
+    let matches = LexemeIndex::search_contains(&pattern, limit);
+
+    if as_json {
+        let payload = json!({
+            "mode": "substring",
+            "pattern": pattern,
+            "limit": limit,
+            "results": matches.iter().map(|(word, id)| {
+                json!({"word": word, "lexeme_id": id})
+            }).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print_search_table(&pattern, &matches);
     }
     Ok(())
 }
@@ -157,6 +191,25 @@ fn print_prefix_table(prefix: &str, rows: &[(String, u32)]) {
         .unwrap_or(prefix.len())
         .max("WORD".len());
     println!("Matches for prefix \"{prefix}\":");
+    println!("{:<width$}  {}", "WORD", "LEXEME_ID", width = width);
+    println!("{:-<width$}  {}", "", "----------", width = width);
+    for (word, id) in rows {
+        println!("{:<width$}  {}", word, id, width = width);
+    }
+}
+
+fn print_search_table(pattern: &str, rows: &[(String, u32)]) {
+    if rows.is_empty() {
+        println!("No lexemes contain \"{pattern}\".");
+        return;
+    }
+    let width = rows
+        .iter()
+        .map(|(word, _)| word.len())
+        .max()
+        .unwrap_or(pattern.len())
+        .max("WORD".len());
+    println!("Matches for substring \"{pattern}\":");
     println!("{:<width$}  {}", "WORD", "LEXEME_ID", width = width);
     println!("{:-<width$}  {}", "", "----------", width = width);
     for (word, id) in rows {
@@ -256,6 +309,19 @@ fn print_entry(entry: &opengloss_rs::LexemeEntry<'_>) {
             println!("    Examples: {examples}");
         }
     }
+
+    if let Some(neighbors) = format_neighbor_ids(entry.synonym_neighbor_ids(), 8) {
+        println!("\nSynonym Links: {neighbors}");
+    }
+    if let Some(neighbors) = format_neighbor_ids(entry.antonym_neighbor_ids(), 8) {
+        println!("Antonym Links: {neighbors}");
+    }
+    if let Some(neighbors) = format_neighbor_ids(entry.hypernym_neighbor_ids(), 8) {
+        println!("Hypernym Links: {neighbors}");
+    }
+    if let Some(neighbors) = format_neighbor_ids(entry.hyponym_neighbor_ids(), 8) {
+        println!("Hyponym Links: {neighbors}");
+    }
 }
 
 fn format_list(items: Vec<&str>, limit: usize) -> Option<String> {
@@ -273,6 +339,30 @@ fn format_list(items: Vec<&str>, limit: usize) -> Option<String> {
         text.push_str(", …");
     }
     Some(text)
+}
+
+fn format_neighbor_ids<I>(ids: I, limit: usize) -> Option<String>
+where
+    I: Iterator<Item = u32>,
+{
+    let mut rendered = Vec::new();
+    let mut count = 0usize;
+    for id in ids {
+        if count >= limit {
+            rendered.push("…".to_string());
+            break;
+        }
+        let label = LexemeIndex::entry_by_id(id)
+            .map(|entry| format!("{} (#{})", entry.word(), id))
+            .unwrap_or_else(|| format!("#{}", id));
+        rendered.push(label);
+        count += 1;
+    }
+    if rendered.is_empty() {
+        None
+    } else {
+        Some(rendered.join(", "))
+    }
 }
 
 fn stdout_is_tty() -> bool {

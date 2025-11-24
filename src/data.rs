@@ -6,6 +6,8 @@ pub type ArchivedStringId = <StringId as Archive>::Archived;
 pub type TextId = u32;
 #[allow(dead_code)]
 pub type ArchivedTextId = <TextId as Archive>::Archived;
+#[allow(dead_code)]
+pub type ArchivedU32 = <u32 as Archive>::Archived;
 
 #[derive(Archive, Serialize, Debug, Clone, Copy)]
 pub struct Range {
@@ -44,6 +46,10 @@ pub struct EntryRecord {
     pub all_inflections: Range,
     pub all_derivations: Range,
     pub all_examples: Range,
+    pub synonym_neighbors: Range,
+    pub antonym_neighbors: Range,
+    pub hypernym_neighbors: Range,
+    pub hyponym_neighbors: Range,
 }
 
 #[derive(Archive, Serialize, Debug)]
@@ -95,4 +101,8 @@ pub struct DataStore {
     pub entry_all_derivations: Vec<StringId>,
     pub entry_all_examples: Vec<StringId>,
     pub entry_etymology_cognates: Vec<StringId>,
+    pub entry_synonym_neighbors: Vec<u32>,
+    pub entry_antonym_neighbors: Vec<u32>,
+    pub entry_hypernym_neighbors: Vec<u32>,
+    pub entry_hyponym_neighbors: Vec<u32>,
 }

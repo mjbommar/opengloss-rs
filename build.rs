@@ -24,6 +24,7 @@ const STORE_ENCYCLOPEDIA_TEXT: bool = true;
 // or tuned via these constants if we need smaller artifacts.
 const ARCHIVE_COMPRESSION_LEVEL: i32 = 4;
 const LONG_TEXT_COMPRESSION_LEVEL: i32 = 5;
+const STRING_COMPRESSION_LEVEL: i32 = 5;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
@@ -31,7 +32,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let lexeme_rows = load_lexemes(&manifest_dir)?;
     build_fst(&lexeme_rows, &out_dir)?;
-    build_data_store(&manifest_dir, &out_dir, lexeme_rows.len())?;
+    let lexeme_lookup: HashMap<String, u32> = lexeme_rows
+        .iter()
+        .map(|(word, id)| (word.clone(), *id))
+        .collect();
+    build_data_store(&manifest_dir, &out_dir, lexeme_rows.len(), lexeme_lookup)?;
 
     Ok(())
 }
@@ -99,6 +104,7 @@ fn build_data_store(
     manifest_dir: &Path,
     out_dir: &Path,
     expected_entries: usize,
+    lexeme_lookup: HashMap<String, u32>,
 ) -> Result<(), Box<dyn Error>> {
     let entries_path = manifest_dir.join("data/entries.jsonl");
     println!("cargo:rerun-if-changed={}", entries_path.display());
@@ -110,7 +116,7 @@ fn build_data_store(
     }
 
     let file = BufReader::new(File::open(&entries_path)?);
-    let mut builder = DataBuilder::new(expected_entries);
+    let mut builder = DataBuilder::new(expected_entries, lexeme_lookup);
     for (line_idx, line_res) in file.lines().enumerate() {
         let line = line_res?;
         if line.trim().is_empty() {
@@ -213,10 +219,15 @@ struct DataBuilder {
     entry_all_derivations: Vec<StringId>,
     entry_all_examples: Vec<StringId>,
     entry_etymology_cognates: Vec<StringId>,
+    entry_synonym_neighbors: Vec<u32>,
+    entry_antonym_neighbors: Vec<u32>,
+    entry_hypernym_neighbors: Vec<u32>,
+    entry_hyponym_neighbors: Vec<u32>,
+    lexeme_lookup: HashMap<String, u32>,
 }
 
 impl DataBuilder {
-    fn new(expected_entries: usize) -> Self {
+    fn new(expected_entries: usize, lexeme_lookup: HashMap<String, u32>) -> Self {
         Self {
             strings: StringTable::default(),
             long_texts: CompressedTextTable::default(),
@@ -238,6 +249,11 @@ impl DataBuilder {
             entry_all_derivations: Vec::new(),
             entry_all_examples: Vec::new(),
             entry_etymology_cognates: Vec::new(),
+            entry_synonym_neighbors: Vec::new(),
+            entry_antonym_neighbors: Vec::new(),
+            entry_hypernym_neighbors: Vec::new(),
+            entry_hyponym_neighbors: Vec::new(),
+            lexeme_lookup,
         }
     }
 
@@ -279,6 +295,27 @@ impl DataBuilder {
             &mut self.entry_etymology_cognates,
             entry.etymology_cognates.into_iter(),
         );
+        let synonym_neighbors = push_neighbor_refs(
+            &self.lexeme_lookup,
+            &mut self.entry_synonym_neighbors,
+            entry.all_synonyms.iter(),
+        );
+        let antonym_neighbors = push_neighbor_refs(
+            &self.lexeme_lookup,
+            &mut self.entry_antonym_neighbors,
+            entry.all_antonyms.iter(),
+        );
+        let hypernym_neighbors = push_neighbor_refs(
+            &self.lexeme_lookup,
+            &mut self.entry_hypernym_neighbors,
+            entry.all_hypernyms.iter(),
+        );
+        let hyponym_neighbors = push_neighbor_refs(
+            &self.lexeme_lookup,
+            &mut self.entry_hyponym_neighbors,
+            entry.all_hyponyms.iter(),
+        );
+
         let all_definitions = push_strings(
             &mut self.strings,
             &mut self.entry_all_definitions,
@@ -348,6 +385,10 @@ impl DataBuilder {
             all_inflections,
             all_derivations,
             all_examples,
+            synonym_neighbors,
+            antonym_neighbors,
+            hypernym_neighbors,
+            hyponym_neighbors,
         });
 
         Ok(())
@@ -430,6 +471,10 @@ impl DataBuilder {
             entry_all_derivations: self.entry_all_derivations,
             entry_all_examples: self.entry_all_examples,
             entry_etymology_cognates: self.entry_etymology_cognates,
+            entry_synonym_neighbors: self.entry_synonym_neighbors,
+            entry_antonym_neighbors: self.entry_antonym_neighbors,
+            entry_hypernym_neighbors: self.entry_hypernym_neighbors,
+            entry_hyponym_neighbors: self.entry_hyponym_neighbors,
         })
     }
 }
@@ -448,9 +493,11 @@ impl StringTable {
             return id;
         }
         let id = self.offsets.len() as u32;
+        let compressed = zstd_compress(value.as_bytes(), STRING_COMPRESSION_LEVEL)
+            .expect("compress short string with zstd");
         self.offsets.push(self.data.len() as u32);
-        self.lengths.push(value.len() as u32);
-        self.data.extend_from_slice(value.as_bytes());
+        self.lengths.push(compressed.len() as u32);
+        self.data.extend_from_slice(&compressed);
         self.map.insert(value.into_boxed_str(), id);
         id
     }
@@ -507,6 +554,23 @@ where
     let start = target.len() as u32;
     for value in iter {
         target.push(table.intern_owned(value));
+    }
+    Range::new(start, target.len() as u32 - start)
+}
+
+fn push_neighbor_refs<'a, I>(
+    lookup: &HashMap<String, u32>,
+    target: &mut Vec<u32>,
+    iter: I,
+) -> Range
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let start = target.len() as u32;
+    for value in iter {
+        if let Some(&lex_id) = lookup.get(value.as_str()) {
+            target.push(lex_id);
+        }
     }
     Range::new(start, target.len() as u32 - start)
 }
