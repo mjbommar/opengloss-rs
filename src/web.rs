@@ -272,6 +272,7 @@ fn render_home(theme: WebTheme, base_url: &str) -> String {
         <div class="{cta_group}">
           <a href="/lexeme?word=algorithm" class="{button_class}">Example lexeme</a>
           <a href="/search?q=gravitation" class="{button_class}">Run a search</a>
+          <a href="/index" class="{button_class}">Browse prefix index</a>
         </div>
       </div>
     </main>
