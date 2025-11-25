@@ -1,11 +1,24 @@
 use std::cmp;
+use std::collections::HashMap;
 use std::error::Error;
+use std::io;
 
 use atty::Stream;
+#[cfg(feature = "web")]
+use clap::Args;
 use clap::{Parser, Subcommand, ValueEnum};
-use opengloss_rs::LexemeIndex;
+#[cfg(feature = "web")]
+use opengloss_rs::web::{self, WebConfig, WebTheme};
+use opengloss_rs::{
+    FieldContribution, GraphOptions, GraphTraversal, LexemeIndex, RelationKind, SearchBreakdown,
+    SearchSummary,
+};
 use serde_json::json;
+#[cfg(feature = "web")]
+use std::net::SocketAddr;
 use termimad::{FmtText, MadSkin, terminal_size};
+#[cfg(feature = "web")]
+use tokio::runtime::Builder as TokioRuntimeBuilder;
 
 #[derive(Parser, Debug)]
 #[command(name = "opengloss-rs", about = "Explore OpenGloss data", version)]
@@ -23,6 +36,9 @@ enum Command {
     /// Operations related to lexemes.
     #[command(subcommand)]
     Lexeme(LexemeCommand),
+    /// Run the embedded web server (requires the `web` feature).
+    #[cfg(feature = "web")]
+    Serve(ServeArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -72,6 +88,9 @@ enum LexemeCommand {
         /// Minimum normalized score (0-1) before emitting a hit.
         #[arg(long, default_value_t = 0.15)]
         min_score: f32,
+        /// Print per-field scoring details and cache info.
+        #[arg(long)]
+        explain: bool,
     },
     /// Show the full entry for a lexeme.
     Show {
@@ -81,6 +100,60 @@ enum LexemeCommand {
         #[arg(long)]
         by_id: bool,
     },
+    /// Traverse neighbor relations (synonym, hypernym, etc.) as a small graph.
+    Graph {
+        /// Word or lexeme ID to use as the graph root.
+        query: String,
+        /// Interpret the query as a lexeme ID instead of a word.
+        #[arg(long)]
+        by_id: bool,
+        /// Depth limit for breadth-first traversal (0 = only the root).
+        #[arg(short, long, default_value_t = 2)]
+        depth: usize,
+        /// Relation types to follow; omit to include all.
+        #[arg(long = "relation", value_enum)]
+        relations: Vec<RelationArg>,
+        /// Maximum number of nodes to visit (0 = unlimited).
+        #[arg(long, default_value_t = 128)]
+        max_nodes: usize,
+        /// Maximum number of edges to record (0 = unlimited).
+        #[arg(long, default_value_t = 256)]
+        max_edges: usize,
+        /// Output format: tree (text), json, or dot (GraphViz).
+        #[arg(long, value_enum, default_value_t = GraphFormat::Tree)]
+        format: GraphFormat,
+    },
+}
+
+#[cfg(feature = "web")]
+#[derive(Args, Debug)]
+struct ServeArgs {
+    /// Address to bind the HTTP server to.
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    addr: String,
+    /// Render OpenAPI docs & JSON spec.
+    #[arg(long, default_value_t = true)]
+    openapi: bool,
+    /// Front-end theme to load for HTML pages.
+    #[arg(long, value_enum, default_value_t = ServeTheme::Tailwind)]
+    theme: ServeTheme,
+}
+
+#[cfg(feature = "web")]
+#[derive(Copy, Clone, Debug, ValueEnum, Eq, PartialEq)]
+enum ServeTheme {
+    Tailwind,
+    Bootstrap,
+}
+
+#[cfg(feature = "web")]
+impl From<ServeTheme> for WebTheme {
+    fn from(value: ServeTheme) -> Self {
+        match value {
+            ServeTheme::Tailwind => WebTheme::Tailwind,
+            ServeTheme::Bootstrap => WebTheme::Bootstrap,
+        }
+    }
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
@@ -101,6 +174,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             weight_text,
             weight_encyclopedia,
             min_score,
+            explain,
         }) => handle_search(
             pattern,
             limit,
@@ -113,10 +187,24 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             weight_text,
             weight_encyclopedia,
             min_score,
+            explain,
         ),
         Command::Lexeme(LexemeCommand::Show { query, by_id }) => {
             handle_show(query, by_id, cli.json)
         }
+        Command::Lexeme(LexemeCommand::Graph {
+            query,
+            by_id,
+            depth,
+            relations,
+            max_nodes,
+            max_edges,
+            format,
+        }) => handle_graph(
+            query, by_id, depth, relations, max_nodes, max_edges, format, cli.json,
+        ),
+        #[cfg(feature = "web")]
+        Command::Serve(args) => handle_serve(args),
     }
 }
 
@@ -160,6 +248,7 @@ fn handle_prefix(prefix: String, limit: usize, as_json: bool) -> Result<(), Box<
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_search(
     pattern: String,
     limit: usize,
@@ -172,12 +261,16 @@ fn handle_search(
     weight_text: f32,
     weight_encyclopedia: f32,
     min_score: f32,
+    explain: bool,
 ) -> Result<(), Box<dyn Error>> {
     if pattern.trim().is_empty() {
         return Err("Search pattern cannot be empty".into());
     }
     match mode {
         SearchMode::Substring => {
+            if explain {
+                return Err("--explain is only available for fuzzy search".into());
+            }
             let limit = cmp::max(1, limit);
             let matches = LexemeIndex::search_contains(&pattern, limit);
             if as_json {
@@ -214,12 +307,18 @@ fn handle_search(
                 return Err("All search weights are zero; nothing to search".into());
             }
             let limit = cmp::max(1, limit);
-            let results = LexemeIndex::search_fuzzy(&pattern, &config, limit);
+            let summary = LexemeIndex::search_fuzzy_with_stats(&pattern, &config, limit);
+            let diagnostics = if explain {
+                LexemeIndex::explain_search(&pattern, &config, &summary.results)
+            } else {
+                Vec::new()
+            };
             if as_json {
                 let payload = json!({
                     "mode": "fuzzy",
                     "pattern": pattern,
                     "limit": limit,
+                    "cache_hit": summary.cache_hit,
                     "config": {
                         "weight_word": config.weight_word,
                         "weight_definitions": config.weight_definitions,
@@ -229,17 +328,33 @@ fn handle_search(
                         "min_score": config.min_score,
                         "fields": selected.iter().map(|f| f.to_string()).collect::<Vec<_>>(),
                     },
-                    "results": results.iter().map(|row| {
+                    "results": summary.results.iter().map(|row| {
                         json!({
                             "lexeme_id": row.lexeme_id,
                             "word": row.word,
                             "score": row.score,
                         })
                     }).collect::<Vec<_>>(),
+                    "diagnostics": if explain {
+                        Some(json!({
+                            "cache_hit": summary.cache_hit,
+                            "breakdowns": diagnostics.iter().map(breakdown_to_json).collect::<Vec<_>>(),
+                        }))
+                    } else {
+                        None
+                    }
                 });
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
-                print_fuzzy_table(&pattern, &results);
+                print_fuzzy_table(&pattern, &summary.results);
+                if explain {
+                    print_search_diagnostics(&summary, &diagnostics);
+                } else {
+                    println!(
+                        "\nCache: {}",
+                        if summary.cache_hit { "hit" } else { "miss" }
+                    );
+                }
             }
             Ok(())
         }
@@ -247,15 +362,7 @@ fn handle_search(
 }
 
 fn handle_show(query: String, by_id: bool, as_json: bool) -> Result<(), Box<dyn Error>> {
-    let entry = if by_id {
-        let id: u32 = query
-            .parse()
-            .map_err(|_| format!("Failed to parse lexeme ID from {query:?}"))?;
-        LexemeIndex::entry_by_id(id).ok_or_else(|| format!("No entry found for lexeme ID {id}"))?
-    } else {
-        LexemeIndex::entry_by_word(&query)
-            .ok_or_else(|| format!("No entry found for word {query:?}"))?
-    };
+    let entry = resolve_entry(&query, by_id)?;
 
     if as_json {
         let payload = entry_to_json(&entry);
@@ -266,6 +373,84 @@ fn handle_show(query: String, by_id: bool, as_json: bool) -> Result<(), Box<dyn 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn handle_graph(
+    query: String,
+    by_id: bool,
+    depth: usize,
+    relations: Vec<RelationArg>,
+    max_nodes: usize,
+    max_edges: usize,
+    mut format: GraphFormat,
+    force_json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let lexeme_id = resolve_lexeme_id(&query, by_id)?;
+    let mut options = GraphOptions {
+        max_depth: depth,
+        max_nodes,
+        max_edges,
+        ..GraphOptions::default()
+    };
+    if !relations.is_empty() {
+        options.relations = relations.into_iter().map(RelationArg::into).collect();
+    }
+    let graph = LexemeIndex::traverse_graph(lexeme_id, &options)
+        .ok_or_else(|| user_error(format!("No entry found for {query:?}")))?;
+    if force_json {
+        format = GraphFormat::Json;
+    }
+    match format {
+        GraphFormat::Tree => print_graph_tree(&graph),
+        GraphFormat::Json => {
+            let payload = graph_to_json(&graph);
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        }
+        GraphFormat::Dot => {
+            println!("{}", graph_to_dot(&graph));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "web")]
+fn handle_serve(args: ServeArgs) -> Result<(), Box<dyn Error>> {
+    let addr: SocketAddr = args
+        .addr
+        .parse()
+        .map_err(|_| user_error(format!("Invalid socket address {:?}", args.addr)))?;
+    let config = WebConfig {
+        addr,
+        enable_openapi: args.openapi,
+        theme: args.theme.into(),
+    };
+    let runtime = TokioRuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(web::serve(config))?;
+    Ok(())
+}
+
+fn resolve_entry(
+    query: &str,
+    by_id: bool,
+) -> Result<opengloss_rs::LexemeEntry<'static>, Box<dyn Error>> {
+    let lexeme_id = resolve_lexeme_id(query, by_id)?;
+    LexemeIndex::entry_by_id(lexeme_id)
+        .ok_or_else(|| user_error(format!("No entry found for lexeme ID {lexeme_id}")))
+}
+
+fn resolve_lexeme_id(query: &str, by_id: bool) -> Result<u32, Box<dyn Error>> {
+    if by_id {
+        query
+            .parse::<u32>()
+            .map_err(|_| user_error(format!("Failed to parse lexeme ID from {query:?}")))
+    } else {
+        LexemeIndex::get(query)
+            .ok_or_else(|| user_error(format!("No entry found for word {query:?}")))
+    }
+}
+
+#[allow(clippy::uninlined_format_args)]
 fn print_lookup_table(rows: &[(String, Option<u32>)]) {
     if rows.is_empty() {
         println!("No words provided.");
@@ -277,16 +462,17 @@ fn print_lookup_table(rows: &[(String, Option<u32>)]) {
         .max()
         .unwrap_or(4)
         .max("WORD".len());
-    println!("{:<width$}  {}", "WORD", "LEXEME_ID", width = width);
-    println!("{:-<width$}  {}", "", "----------", width = width);
+    println!("{:<width$}  LEXEME_ID", "WORD", width = width);
+    println!("{:-<width$}  ----------", "", width = width);
     for (word, id) in rows {
         let value = id
             .map(|v| v.to_string())
             .unwrap_or_else(|| "<missing>".to_string());
-        println!("{:<width$}  {}", word, value, width = width);
+        println!("{word:<width$}  {value}", width = width);
     }
 }
 
+#[allow(clippy::uninlined_format_args)]
 fn print_prefix_table(prefix: &str, rows: &[(String, u32)]) {
     if rows.is_empty() {
         println!("No lexemes matched prefix \"{prefix}\".");
@@ -299,13 +485,14 @@ fn print_prefix_table(prefix: &str, rows: &[(String, u32)]) {
         .unwrap_or(prefix.len())
         .max("WORD".len());
     println!("Matches for prefix \"{prefix}\":");
-    println!("{:<width$}  {}", "WORD", "LEXEME_ID", width = width);
-    println!("{:-<width$}  {}", "", "----------", width = width);
+    println!("{:<width$}  LEXEME_ID", "WORD", width = width);
+    println!("{:-<width$}  ----------", "", width = width);
     for (word, id) in rows {
-        println!("{:<width$}  {}", word, id, width = width);
+        println!("{word:<width$}  {id}", width = width);
     }
 }
 
+#[allow(clippy::uninlined_format_args)]
 fn print_search_table(pattern: &str, rows: &[(String, u32)]) {
     if rows.is_empty() {
         println!("No lexemes contain \"{pattern}\".");
@@ -318,13 +505,14 @@ fn print_search_table(pattern: &str, rows: &[(String, u32)]) {
         .unwrap_or(pattern.len())
         .max("WORD".len());
     println!("Matches for substring \"{pattern}\":");
-    println!("{:<width$}  {}", "WORD", "LEXEME_ID", width = width);
-    println!("{:-<width$}  {}", "", "----------", width = width);
+    println!("{:<width$}  LEXEME_ID", "WORD", width = width);
+    println!("{:-<width$}  ----------", "", width = width);
     for (word, id) in rows {
-        println!("{:<width$}  {}", word, id, width = width);
+        println!("{word:<width$}  {id}", width = width);
     }
 }
 
+#[allow(clippy::uninlined_format_args)]
 fn print_fuzzy_table(pattern: &str, rows: &[opengloss_rs::SearchResult]) {
     if rows.is_empty() {
         println!("No fuzzy matches found for \"{pattern}\".");
@@ -338,28 +526,207 @@ fn print_fuzzy_table(pattern: &str, rows: &[opengloss_rs::SearchResult]) {
         .max("WORD".len());
     println!("Fuzzy matches for \"{pattern}\":");
     println!(
-        "{:<width$}  {:<8}  {}",
+        "{:<width$}  {:<8}  LEXEME_ID",
         "WORD",
         "SCORE",
-        "LEXEME_ID",
         width = width
     );
     println!(
-        "{:-<width$}  {:<8}  {}",
+        "{:-<width$}  {:<8}  ----------",
         "",
         "--------",
-        "----------",
         width = width
     );
     for row in rows {
         println!(
-            "{:<width$}  {:<8.3}  {}",
-            row.word,
-            row.score,
-            row.lexeme_id,
+            "{word:<width$}  {score:<8.3}  {id}",
+            word = row.word,
+            score = row.score,
+            id = row.lexeme_id,
             width = width
         );
     }
+}
+
+fn print_search_diagnostics(summary: &SearchSummary, breakdowns: &[SearchBreakdown]) {
+    println!("\nSearch diagnostics:");
+    println!(
+        "  Cache: {}",
+        if summary.cache_hit { "hit" } else { "miss" }
+    );
+    if breakdowns.is_empty() {
+        println!("  No breakdowns available.");
+        return;
+    }
+    for (idx, row) in breakdowns.iter().enumerate() {
+        println!(
+            "\nResult #{idx}: {} (#{}) — total {:.3}",
+            row.word, row.lexeme_id, row.total_score
+        );
+        if row.fields.is_empty() {
+            println!("    (no weighted fields)");
+            continue;
+        }
+        println!("    {:<14} {:>7} {:>7}  SAMPLE", "FIELD", "SCORE", "WEIGHT");
+        for field in &row.fields {
+            print_field_line(field);
+        }
+    }
+}
+
+fn print_field_line(field: &FieldContribution) {
+    let sample = field.sample.as_deref().unwrap_or("-");
+    println!(
+        "    {:<14} {:>7.3} {:>7.3}  {}",
+        field.field, field.score, field.weight, sample
+    );
+}
+
+fn breakdown_to_json(row: &SearchBreakdown) -> serde_json::Value {
+    json!({
+        "lexeme_id": row.lexeme_id,
+        "word": row.word,
+        "total_score": row.total_score,
+        "fields": row.fields.iter().map(|field| {
+            json!({
+                "field": field.field.to_string(),
+                "score": field.score,
+                "weight": field.weight,
+                "sample": field.sample,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn print_graph_tree(graph: &GraphTraversal) {
+    if graph.nodes.is_empty() {
+        println!("No nodes were visited; consider increasing --depth or --max-nodes.");
+        return;
+    }
+    let node_map: HashMap<u32, &opengloss_rs::GraphNode> = graph
+        .nodes
+        .iter()
+        .map(|node| (node.lexeme_id, node))
+        .collect();
+    let root = match node_map.get(&graph.root) {
+        Some(node) => node,
+        None => {
+            println!(
+                "Graph root #{:?} is missing from traversal output.",
+                graph.root
+            );
+            return;
+        }
+    };
+    let mut children: HashMap<u32, Vec<(u32, RelationKind)>> = HashMap::new();
+    for edge in &graph.edges {
+        children
+            .entry(edge.from)
+            .or_default()
+            .push((edge.to, edge.relation));
+    }
+    for edges in children.values_mut() {
+        edges.sort_by(|(left_id, left_rel), (right_id, right_rel)| {
+            let left_word = node_map
+                .get(left_id)
+                .map(|node| node.word.as_str())
+                .unwrap_or("");
+            let right_word = node_map
+                .get(right_id)
+                .map(|node| node.word.as_str())
+                .unwrap_or("");
+            left_word
+                .cmp(right_word)
+                .then_with(|| left_rel.label().cmp(right_rel.label()))
+        });
+    }
+
+    println!(
+        "Graph root: {} (#{}), visited {} nodes / {} edges, reached depth {}",
+        root.word,
+        root.lexeme_id,
+        graph.nodes.len(),
+        graph.edges.len(),
+        graph.max_depth_reached
+    );
+    if let Some(kids) = children.get(&graph.root) {
+        for (child_id, relation) in kids {
+            print_graph_branch(*child_id, *relation, 0, &node_map, &children);
+        }
+    } else {
+        println!("  (no neighbors within the current limits)");
+    }
+}
+
+fn print_graph_branch(
+    node_id: u32,
+    relation: RelationKind,
+    depth: usize,
+    nodes: &HashMap<u32, &opengloss_rs::GraphNode>,
+    children: &HashMap<u32, Vec<(u32, RelationKind)>>,
+) {
+    if let Some(node) = nodes.get(&node_id) {
+        let padding = "  ".repeat(depth + 1);
+        println!(
+            "{padding}- [{}] {} (#{} depth {})",
+            relation, node.word, node.lexeme_id, node.depth
+        );
+        if let Some(kids) = children.get(&node_id) {
+            for (child_id, rel) in kids {
+                print_graph_branch(*child_id, *rel, depth + 1, nodes, children);
+            }
+        }
+    }
+}
+
+fn graph_to_json(graph: &GraphTraversal) -> serde_json::Value {
+    json!({
+        "root": graph.root,
+        "max_depth_reached": graph.max_depth_reached,
+        "nodes": graph.nodes.iter().map(|node| {
+            json!({
+                "lexeme_id": node.lexeme_id,
+                "word": node.word,
+                "depth": node.depth,
+                "parent": node.parent,
+                "relation": node.via.map(|rel| rel.to_string()),
+            })
+        }).collect::<Vec<_>>(),
+        "edges": graph.edges.iter().map(|edge| {
+            json!({
+                "from": edge.from,
+                "to": edge.to,
+                "relation": edge.relation.to_string(),
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn graph_to_dot(graph: &GraphTraversal) -> String {
+    let mut out = String::from("digraph Opengloss {\n  node [shape=box];\n");
+    for node in &graph.nodes {
+        let label = format!("{} (#{} depth {})", node.word, node.lexeme_id, node.depth);
+        out.push_str(&format!(
+            "  n{} [label=\"{}\"];\n",
+            node.lexeme_id,
+            escape_label(&label)
+        ));
+    }
+    for edge in &graph.edges {
+        out.push_str(&format!(
+            "  n{} -> n{} [label=\"{}\"];",
+            edge.from,
+            edge.to,
+            escape_label(edge.relation.label())
+        ));
+        out.push('\n');
+    }
+    out.push_str("}\n");
+    out
+}
+
+fn escape_label(label: &str) -> String {
+    label.replace('"', "\\\"")
 }
 
 fn entry_to_json(entry: &opengloss_rs::LexemeEntry<'_>) -> serde_json::Value {
@@ -491,17 +858,15 @@ where
     I: Iterator<Item = u32>,
 {
     let mut rendered = Vec::new();
-    let mut count = 0usize;
-    for id in ids {
+    for (count, id) in ids.enumerate() {
         if count >= limit {
             rendered.push("…".to_string());
             break;
         }
         let label = LexemeIndex::entry_by_id(id)
-            .map(|entry| format!("{} (#{})", entry.word(), id))
-            .unwrap_or_else(|| format!("#{}", id));
+            .map(|entry| format!("{} (#{id})", entry.word()))
+            .unwrap_or_else(|| format!("#{id}"));
         rendered.push(label);
-        count += 1;
     }
     if rendered.is_empty() {
         None
@@ -555,10 +920,40 @@ fn render_markdown_block(title: &str, body: &str) {
         println!("{trimmed}");
     }
 }
+
+fn user_error(msg: impl Into<String>) -> Box<dyn Error> {
+    io::Error::new(io::ErrorKind::InvalidInput, msg.into()).into()
+}
 #[derive(Copy, Clone, Debug, ValueEnum, Eq, PartialEq)]
 enum SearchMode {
     Fuzzy,
     Substring,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, Eq, PartialEq)]
+enum GraphFormat {
+    Tree,
+    Json,
+    Dot,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, Eq, PartialEq, Hash)]
+enum RelationArg {
+    Synonym,
+    Antonym,
+    Hypernym,
+    Hyponym,
+}
+
+impl From<RelationArg> for RelationKind {
+    fn from(value: RelationArg) -> Self {
+        match value {
+            RelationArg::Synonym => RelationKind::Synonym,
+            RelationArg::Antonym => RelationKind::Antonym,
+            RelationArg::Hypernym => RelationKind::Hypernym,
+            RelationArg::Hyponym => RelationKind::Hyponym,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, Eq, PartialEq, Hash)]

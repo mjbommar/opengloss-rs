@@ -1,6 +1,6 @@
 [package]
 name = "opengloss-rs"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Michael Bommarito <michael.bommarito@gmail.com>"]
 
@@ -8,6 +8,7 @@ authors = ["Michael Bommarito <michael.bommarito@gmail.com>"]
 fst = "0.4.7"
 once_cell = "1.19.0"
 clap = { version = "4.5.13", features = ["derive"], optional = true }
+serde = { version = "1.0.210", features = ["derive"] }
 serde_json = { version = "1.0.118", optional = true }
 rkyv = "0.8.12"
 zstd = "0.13.3"
@@ -17,6 +18,16 @@ rapidfuzz = "0.5"
 rayon = "1.11"
 lru = "0.12"
 parking_lot = "0.12"
+tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "signal"], optional = true }
+axum = { version = "0.7", features = ["macros", "json"], optional = true }
+tower-http = { version = "0.5", features = ["trace", "compression-full", "cors", "propagate-header", "util", "fs"], optional = true }
+askama = { version = "0.12", features = ["with-axum"], optional = true }
+askama_axum = { version = "0.3", optional = true }
+utoipa = { version = "5", features = ["axum_extras"], optional = true }
+utoipa-axum = { version = "0.2", optional = true }
+utoipa-swagger-ui = { version = "9", features = ["axum"], optional = true }
+include_dir = { version = "0.7", optional = true }
+mime = { version = "0.3", optional = true }
 
 [build-dependencies]
 fst = "0.4.7"
@@ -27,10 +38,24 @@ zstd = "0.13.3"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+tower = "0.5"
 
 [features]
 default = ["cli"]
 cli = ["clap", "serde_json", "termimad", "atty"]
+web = [
+    "serde_json",
+    "tokio",
+    "axum",
+    "tower-http",
+    "askama",
+    "askama_axum",
+    "utoipa",
+    "utoipa-axum",
+    "include_dir",
+    "mime",
+]
+web-openapi = ["web", "utoipa-swagger-ui"]
 
 [[bench]]
 name = "lexeme"

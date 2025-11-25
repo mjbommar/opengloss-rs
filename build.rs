@@ -287,13 +287,13 @@ impl DataBuilder {
         let parts_of_speech = push_strings(
             &mut self.strings,
             &mut self.entry_parts_of_speech,
-            entry.parts_of_speech.into_iter(),
+            entry.parts_of_speech,
         );
         let senses_range = self.push_senses(entry.lexeme_id, entry.senses);
         let etymology_cognates = push_strings(
             &mut self.strings,
             &mut self.entry_etymology_cognates,
-            entry.etymology_cognates.into_iter(),
+            entry.etymology_cognates,
         );
         let synonym_neighbors = push_neighbor_refs(
             &self.lexeme_lookup,
@@ -319,47 +319,47 @@ impl DataBuilder {
         let all_definitions = push_strings(
             &mut self.strings,
             &mut self.entry_all_definitions,
-            entry.all_definitions.into_iter(),
+            entry.all_definitions,
         );
         let all_synonyms = push_strings(
             &mut self.strings,
             &mut self.entry_all_synonyms,
-            entry.all_synonyms.into_iter(),
+            entry.all_synonyms,
         );
         let all_antonyms = push_strings(
             &mut self.strings,
             &mut self.entry_all_antonyms,
-            entry.all_antonyms.into_iter(),
+            entry.all_antonyms,
         );
         let all_hypernyms = push_strings(
             &mut self.strings,
             &mut self.entry_all_hypernyms,
-            entry.all_hypernyms.into_iter(),
+            entry.all_hypernyms,
         );
         let all_hyponyms = push_strings(
             &mut self.strings,
             &mut self.entry_all_hyponyms,
-            entry.all_hyponyms.into_iter(),
+            entry.all_hyponyms,
         );
         let all_collocations = push_strings(
             &mut self.strings,
             &mut self.entry_all_collocations,
-            entry.all_collocations.into_iter(),
+            entry.all_collocations,
         );
         let all_inflections = push_strings(
             &mut self.strings,
             &mut self.entry_all_inflections,
-            entry.all_inflections.into_iter(),
+            entry.all_inflections,
         );
         let all_derivations = push_strings(
             &mut self.strings,
             &mut self.entry_all_derivations,
-            entry.all_derivations.into_iter(),
+            entry.all_derivations,
         );
         let all_examples = push_strings(
             &mut self.strings,
             &mut self.entry_all_examples,
-            entry.all_examples.into_iter(),
+            entry.all_examples,
         );
 
         self.entries.push(EntryRecord {

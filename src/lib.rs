@@ -1,5 +1,8 @@
 mod data;
 
+#[cfg(feature = "web")]
+pub mod web;
+
 use data::{
     ArchivedCompressedTextStore, ArchivedDataStore, ArchivedEntryRecord, ArchivedPackedStrings,
     ArchivedRange, ArchivedSenseRecord, ArchivedStringId, ArchivedTextId, ArchivedU32,
@@ -14,7 +17,8 @@ use rayon::prelude::*;
 use rkyv::access_unchecked;
 use rkyv::util::AlignedVec;
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet, VecDeque};
+use std::fmt;
 use std::io::{Cursor, Read};
 use std::str;
 use std::sync::OnceLock;
@@ -37,13 +41,89 @@ static STRING_CACHE: Lazy<Vec<OnceLock<&'static str>>> = Lazy::new(|| {
     let len = data_store().strings.len();
     (0..len).map(|_| OnceLock::new()).collect()
 });
+#[allow(clippy::type_complexity)]
 static SUBSTRING_CACHE: Lazy<Mutex<lru::LruCache<String, Vec<(String, u32)>>>> =
     Lazy::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(64).unwrap())));
+#[allow(clippy::type_complexity)]
 static FUZZY_CACHE: Lazy<Mutex<lru::LruCache<(String, SearchConfig, usize), Vec<SearchResult>>>> =
     Lazy::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(32).unwrap())));
 
 /// Read-only access to the lexeme trie.
 pub struct LexemeIndex;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RelationKind {
+    Synonym,
+    Antonym,
+    Hypernym,
+    Hyponym,
+}
+
+impl RelationKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            RelationKind::Synonym => "synonym",
+            RelationKind::Antonym => "antonym",
+            RelationKind::Hypernym => "hypernym",
+            RelationKind::Hyponym => "hyponym",
+        }
+    }
+
+    fn all() -> &'static [RelationKind] {
+        use RelationKind::*;
+        const ALL: [RelationKind; 4] = [Synonym, Antonym, Hypernym, Hyponym];
+        &ALL
+    }
+}
+
+impl fmt::Display for RelationKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphOptions {
+    pub max_depth: usize,
+    pub max_nodes: usize,
+    pub max_edges: usize,
+    pub relations: Vec<RelationKind>,
+}
+
+impl Default for GraphOptions {
+    fn default() -> Self {
+        Self {
+            max_depth: 2,
+            max_nodes: usize::MAX,
+            max_edges: usize::MAX,
+            relations: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphNode {
+    pub lexeme_id: u32,
+    pub word: String,
+    pub depth: usize,
+    pub parent: Option<u32>,
+    pub via: Option<RelationKind>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphEdge {
+    pub from: u32,
+    pub to: u32,
+    pub relation: RelationKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphTraversal {
+    pub root: u32,
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    pub max_depth_reached: usize,
+}
 
 impl LexemeIndex {
     /// Returns the lexeme ID for an exact word match.
@@ -81,12 +161,12 @@ impl LexemeIndex {
         let mut stream = LEXEME_MAP.stream();
         let mut results = Vec::new();
         while let Some((key, value)) = stream.next() {
-            if let Ok(word) = std::str::from_utf8(key) {
-                if word.contains(pattern) {
-                    results.push((word.to_owned(), value as u32));
-                    if results.len() >= limit {
-                        break;
-                    }
+            if let Ok(word) = std::str::from_utf8(key)
+                && word.contains(pattern)
+            {
+                results.push((word.to_owned(), value as u32));
+                if results.len() >= limit {
+                    break;
                 }
             }
         }
@@ -98,12 +178,34 @@ impl LexemeIndex {
 
     /// Performs a weighted fuzzy search over all entries.
     pub fn search_fuzzy(query: &str, config: &SearchConfig, limit: usize) -> Vec<SearchResult> {
+        Self::search_fuzzy_with_stats(query, config, limit).results
+    }
+
+    /// Performs a weighted fuzzy search and returns cache insights.
+    pub fn search_fuzzy_with_stats(
+        query: &str,
+        config: &SearchConfig,
+        limit: usize,
+    ) -> SearchSummary {
         if query.trim().is_empty() || config.total_weight() <= 0.0 {
-            return Vec::new();
+            return SearchSummary {
+                results: Vec::new(),
+                cache_hit: false,
+            };
         }
         let store = data_store();
         let limit = limit.max(1);
         let config = config.clone();
+        let key = (query.to_owned(), config.clone(), limit);
+        {
+            let mut cache = FUZZY_CACHE.lock();
+            if let Some(hit) = cache.get(&key) {
+                return SearchSummary {
+                    results: hit.clone(),
+                    cache_hit: true,
+                };
+            }
+        }
 
         let heap = store
             .entries
@@ -122,30 +224,27 @@ impl LexemeIndex {
                     }
                 })
             })
-            .fold(
-                || BinaryHeap::new(),
-                |mut heap, item| {
-                    push_ranked(&mut heap, item, limit);
-                    heap
-                },
-            )
-            .reduce(
-                || BinaryHeap::new(),
-                |mut left, mut right| {
-                    if left.len() < right.len() {
-                        std::mem::swap(&mut left, &mut right);
-                    }
-                    for item in right.drain() {
-                        push_ranked(&mut left, item, limit);
-                    }
-                    left
-                },
-            );
+            .fold(BinaryHeap::new, |mut heap, item| {
+                push_ranked(&mut heap, item, limit);
+                heap
+            })
+            .reduce(BinaryHeap::new, |mut left, mut right| {
+                if left.len() < right.len() {
+                    std::mem::swap(&mut left, &mut right);
+                }
+                for item in right.drain() {
+                    push_ranked(&mut left, item, limit);
+                }
+                left
+            });
 
         let results = drain_heap(heap);
         let mut cache = FUZZY_CACHE.lock();
-        cache.put((query.to_owned(), config.clone(), limit), results.clone());
-        results
+        cache.put(key, results.clone());
+        SearchSummary {
+            results,
+            cache_hit: false,
+        }
     }
 
     /// Returns the lexeme entry for the given ID, if available.
@@ -162,6 +261,110 @@ impl LexemeIndex {
     /// Resolves a word to its entry.
     pub fn entry_by_word(word: &str) -> Option<LexemeEntry<'static>> {
         Self::get(word).and_then(Self::entry_by_id)
+    }
+
+    /// Produces detailed score breakdowns for a set of results.
+    pub fn explain_search(
+        query: &str,
+        config: &SearchConfig,
+        results: &[SearchResult],
+    ) -> Vec<SearchBreakdown> {
+        let store = data_store();
+        results
+            .iter()
+            .filter_map(|row| {
+                store
+                    .entries
+                    .get(row.lexeme_id as usize)
+                    .and_then(|entry| explain_entry(query, store, entry, config))
+            })
+            .collect()
+    }
+
+    /// Traverses the neighbor graph with a depth-limited BFS.
+    pub fn traverse_graph(lexeme_id: u32, options: &GraphOptions) -> Option<GraphTraversal> {
+        let opts = GraphOptions {
+            max_depth: options.max_depth,
+            max_nodes: if options.max_nodes == 0 {
+                usize::MAX
+            } else {
+                options.max_nodes
+            },
+            max_edges: if options.max_edges == 0 {
+                usize::MAX
+            } else {
+                options.max_edges
+            },
+            relations: if options.relations.is_empty() {
+                RelationKind::all().to_vec()
+            } else {
+                options.relations.clone()
+            },
+        };
+        let _ = Self::entry_by_id(lexeme_id)?;
+
+        let mut visited: HashSet<u32> = HashSet::new();
+        visited.insert(lexeme_id);
+        let mut queue = VecDeque::new();
+        queue.push_back((lexeme_id, 0usize, None, None));
+
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut max_depth_reached = 0usize;
+
+        while let Some((current_id, depth, parent, via)) = queue.pop_front() {
+            if nodes.len() >= opts.max_nodes {
+                break;
+            }
+            let entry = match Self::entry_by_id(current_id) {
+                Some(e) => e,
+                None => continue,
+            };
+            let word = entry.word().to_string();
+            nodes.push(GraphNode {
+                lexeme_id: current_id,
+                word,
+                depth,
+                parent,
+                via,
+            });
+            max_depth_reached = max_depth_reached.max(depth);
+
+            if depth >= opts.max_depth {
+                continue;
+            }
+            for relation in &opts.relations {
+                let neighbors = entry.neighbor_ids(*relation);
+                for neighbor_id in neighbors {
+                    if visited.contains(&neighbor_id) {
+                        continue;
+                    }
+                    if edges.len() >= opts.max_edges {
+                        break;
+                    }
+                    if nodes.len() + queue.len() >= opts.max_nodes {
+                        continue;
+                    }
+                    edges.push(GraphEdge {
+                        from: current_id,
+                        to: neighbor_id,
+                        relation: *relation,
+                    });
+                    visited.insert(neighbor_id);
+                    queue.push_back((neighbor_id, depth + 1, Some(current_id), Some(*relation)));
+                }
+                if edges.len() >= opts.max_edges {
+                    break;
+                }
+            }
+        }
+
+        Some(GraphTraversal {
+            root: lexeme_id,
+            nodes,
+            edges,
+            max_depth_reached,
+        })
     }
 }
 
@@ -355,6 +558,15 @@ impl<'a> LexemeEntry<'a> {
             self.store.entry_hyponym_neighbors.as_slice(),
         )
     }
+
+    pub fn neighbor_ids(&'a self, relation: RelationKind) -> Vec<u32> {
+        match relation {
+            RelationKind::Synonym => self.synonym_neighbor_ids().collect(),
+            RelationKind::Antonym => self.antonym_neighbor_ids().collect(),
+            RelationKind::Hypernym => self.hypernym_neighbor_ids().collect(),
+            RelationKind::Hyponym => self.hyponym_neighbor_ids().collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -419,6 +631,55 @@ pub struct SearchResult {
     pub lexeme_id: u32,
     pub word: String,
     pub score: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchSummary {
+    pub results: Vec<SearchResult>,
+    pub cache_hit: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FieldKind {
+    Word,
+    Definitions,
+    Synonyms,
+    Text,
+    Encyclopedia,
+}
+
+impl FieldKind {
+    fn label(self) -> &'static str {
+        match self {
+            FieldKind::Word => "word",
+            FieldKind::Definitions => "definitions",
+            FieldKind::Synonyms => "synonyms",
+            FieldKind::Text => "text",
+            FieldKind::Encyclopedia => "encyclopedia",
+        }
+    }
+}
+
+impl fmt::Display for FieldKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldContribution {
+    pub field: FieldKind,
+    pub score: f32,
+    pub weight: f32,
+    pub sample: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchBreakdown {
+    pub lexeme_id: u32,
+    pub word: String,
+    pub total_score: f32,
+    pub fields: Vec<FieldContribution>,
 }
 
 pub struct SenseIter<'a> {
@@ -624,10 +885,10 @@ impl PartialOrd for RankedResult {
 fn push_ranked(heap: &mut BinaryHeap<RankedResult>, item: RankedResult, limit: usize) {
     if heap.len() < limit {
         heap.push(item);
-    } else if let Some(mut peek) = heap.peek_mut() {
-        if item.score > peek.score {
-            *peek = item;
-        }
+    } else if let Some(mut peek) = heap.peek_mut()
+        && item.score > peek.score
+    {
+        *peek = item;
     }
 }
 
@@ -682,22 +943,22 @@ fn score_entry(
         accum += s * config.weight_synonyms;
     }
 
-    if config.weight_text > 0.0 {
-        if let Some(text_id) = entry.text.as_ref() {
-            let text = store.decompress_long_text(*text_id);
-            let s = fuzzy_score(query, &text);
-            total_weight += config.weight_text;
-            accum += s * config.weight_text;
-        }
+    if config.weight_text > 0.0
+        && let Some(text_id) = entry.text.as_ref()
+    {
+        let text = store.decompress_long_text(*text_id);
+        let s = fuzzy_score(query, &text);
+        total_weight += config.weight_text;
+        accum += s * config.weight_text;
     }
 
-    if config.weight_encyclopedia > 0.0 {
-        if let Some(enc_id) = entry.encyclopedia_entry.as_ref() {
-            let text = store.decompress_long_text(*enc_id);
-            let s = fuzzy_score(query, &text);
-            total_weight += config.weight_encyclopedia;
-            accum += s * config.weight_encyclopedia;
-        }
+    if config.weight_encyclopedia > 0.0
+        && let Some(enc_id) = entry.encyclopedia_entry.as_ref()
+    {
+        let text = store.decompress_long_text(*enc_id);
+        let s = fuzzy_score(query, &text);
+        total_weight += config.weight_encyclopedia;
+        accum += s * config.weight_encyclopedia;
     }
 
     if total_weight > 0.0 {
@@ -729,4 +990,140 @@ fn fuzzy_score(query: &str, value: &str) -> f32 {
     } else {
         fuzz::ratio(query.chars(), value.chars()) as f32
     }
+}
+
+fn explain_entry(
+    query: &str,
+    store: &ArchivedDataStore,
+    entry: &ArchivedEntryRecord,
+    config: &SearchConfig,
+) -> Option<SearchBreakdown> {
+    let mut total_weight = 0.0;
+    let mut accum = 0.0;
+    let mut fields = Vec::new();
+
+    if config.weight_word > 0.0 {
+        let word = store.string_from_archived(entry.word);
+        let score = fuzzy_score(query, word);
+        total_weight += config.weight_word;
+        accum += score * config.weight_word;
+        fields.push(FieldContribution {
+            field: FieldKind::Word,
+            score,
+            weight: config.weight_word,
+            sample: Some(word.to_string()),
+        });
+    }
+
+    if config.weight_definitions > 0.0 {
+        let (score, sample) = best_range_score_with_sample(
+            query,
+            store,
+            &entry.all_definitions,
+            store.entry_all_definitions.as_slice(),
+        );
+        total_weight += config.weight_definitions;
+        accum += score * config.weight_definitions;
+        fields.push(FieldContribution {
+            field: FieldKind::Definitions,
+            score,
+            weight: config.weight_definitions,
+            sample,
+        });
+    }
+
+    if config.weight_synonyms > 0.0 {
+        let (score, sample) = best_range_score_with_sample(
+            query,
+            store,
+            &entry.all_synonyms,
+            store.entry_all_synonyms.as_slice(),
+        );
+        total_weight += config.weight_synonyms;
+        accum += score * config.weight_synonyms;
+        fields.push(FieldContribution {
+            field: FieldKind::Synonyms,
+            score,
+            weight: config.weight_synonyms,
+            sample,
+        });
+    }
+
+    if config.weight_text > 0.0 {
+        let text = entry
+            .text
+            .as_ref()
+            .map(|id| store.decompress_long_text(*id));
+        if let Some(body) = text {
+            let score = fuzzy_score(query, &body);
+            total_weight += config.weight_text;
+            accum += score * config.weight_text;
+            fields.push(FieldContribution {
+                field: FieldKind::Text,
+                score,
+                weight: config.weight_text,
+                sample: Some(truncate_sample(&body)),
+            });
+        }
+    }
+
+    if config.weight_encyclopedia > 0.0 {
+        let text = entry
+            .encyclopedia_entry
+            .as_ref()
+            .map(|id| store.decompress_long_text(*id));
+        if let Some(body) = text {
+            let score = fuzzy_score(query, &body);
+            total_weight += config.weight_encyclopedia;
+            accum += score * config.weight_encyclopedia;
+            fields.push(FieldContribution {
+                field: FieldKind::Encyclopedia,
+                score,
+                weight: config.weight_encyclopedia,
+                sample: Some(truncate_sample(&body)),
+            });
+        }
+    }
+
+    if total_weight <= 0.0 {
+        return None;
+    }
+
+    Some(SearchBreakdown {
+        lexeme_id: entry.lexeme_id.to_native(),
+        word: store.string_from_archived(entry.word).to_string(),
+        total_score: accum / total_weight,
+        fields,
+    })
+}
+
+fn best_range_score_with_sample(
+    query: &str,
+    store: &ArchivedDataStore,
+    range: &ArchivedRange,
+    bucket: &[ArchivedStringId],
+) -> (f32, Option<String>) {
+    let mut best = 0.0;
+    let mut sample = None;
+    for value in string_iter(store, range, bucket) {
+        let s = fuzzy_score(query, value);
+        if s >= best {
+            best = s;
+            sample = Some(value.to_string());
+        }
+    }
+    (best, sample.map(|text| truncate_sample(&text)))
+}
+
+fn truncate_sample(text: &str) -> String {
+    const MAX: usize = 96;
+    let mut snippet = String::new();
+    for (idx, ch) in text.chars().enumerate() {
+        if idx >= MAX {
+            snippet.push('…');
+            return snippet;
+        }
+        snippet.push(ch);
+    }
+    snippet
 }
