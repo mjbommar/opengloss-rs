@@ -8,6 +8,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::get,
 };
+use markdown::{Options as MarkdownOptions, to_html_with_options};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -24,7 +25,9 @@ use tracing::info;
 type SharedState = Arc<AppState>;
 const MAX_PREFIX_LEVEL: usize = 4;
 const MAX_WORDS_DISPLAY: usize = 750;
-type SafeJson = MarkupDisplay<HtmlEscaper, String>;
+type SafeMarkup = MarkupDisplay<HtmlEscaper, String>;
+type SafeJson = SafeMarkup;
+type SafeHtml = SafeMarkup;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -304,11 +307,30 @@ async fn lexeme_html(
             let payload = LexemePayload::from_entry(&entry);
             let json_ld =
                 MarkupDisplay::new_safe(lexeme_json_ld(&entry, &state.base_url), HtmlEscaper);
+            let entry_text_html = render_markdown(payload.text.as_deref());
+            let encyclopedia_html = render_markdown(payload.encyclopedia_entry.as_deref());
+            let definition_blocks = render_markdown_list(&payload.all_definitions);
+            let has_definitions = !definition_blocks.is_empty();
+            let senses = payload
+                .senses
+                .iter()
+                .map(|sense| SenseBlock {
+                    payload: sense,
+                    definition_html: render_markdown(sense.definition.as_deref()),
+                })
+                .collect();
+            let sense_count = payload.senses.len();
             let template = LexemeTemplate {
                 chrome,
                 payload: &payload,
                 canonical_url: absolute_lexeme_url(&state.base_url, entry.word()),
                 json_ld,
+                entry_text_html,
+                encyclopedia_html,
+                definition_blocks,
+                senses,
+                sense_count,
+                has_definitions,
             };
             Html(
                 template
@@ -530,6 +552,11 @@ struct IndexPagePayload<'a> {
     max_display: usize,
     levels: Vec<PrefixLevelPayload>,
     words: Vec<WordLinkPayload<'a>>,
+}
+
+struct SenseBlock<'a> {
+    payload: &'a SensePayload,
+    definition_html: Option<SafeHtml>,
 }
 
 impl LexemePayload {
@@ -974,6 +1001,31 @@ fn xml_escape(input: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+fn markdown_options() -> MarkdownOptions {
+    MarkdownOptions::gfm()
+}
+
+fn render_markdown(input: Option<&str>) -> Option<SafeHtml> {
+    input.and_then(render_markdown_str)
+}
+
+fn render_markdown_str(input: &str) -> Option<SafeHtml> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let options = markdown_options();
+    let html = to_html_with_options(trimmed, &options).unwrap_or_else(|_| trimmed.to_string());
+    Some(MarkupDisplay::new_safe(html, HtmlEscaper))
+}
+
+fn render_markdown_list(items: &[String]) -> Vec<SafeHtml> {
+    items
+        .iter()
+        .filter_map(|item| render_markdown_str(item))
+        .collect()
+}
+
 #[derive(Template)]
 #[template(
     source = r#"<!DOCTYPE html>
@@ -1008,16 +1060,16 @@ fn xml_escape(input: &str) -> String {
           {% if payload.parts_of_speech.len() > 0 %}
           <a href='#parts-of-speech' class="nav-link px-3 py-1 rounded-full bg-slate-200 hover:bg-slate-300 text-slate-700">Parts of speech</a>
           {% endif %}
-          {% if payload.text.is_some() %}
+          {% if entry_text_html.is_some() %}
           <a href='#entry-text' class="nav-link px-3 py-1 rounded-full bg-slate-200 hover:bg-slate-300 text-slate-700">Entry text</a>
           {% endif %}
-          {% if payload.all_definitions.len() > 0 %}
+          {% if has_definitions %}
           <a href='#definitions' class="nav-link px-3 py-1 rounded-full bg-slate-200 hover:bg-slate-300 text-slate-700">Definitions</a>
           {% endif %}
-          {% if payload.senses.len() > 0 %}
+          {% if sense_count > 0 %}
           <a href='#senses' class="nav-link px-3 py-1 rounded-full bg-slate-200 hover:bg-slate-300 text-slate-700">Senses</a>
           {% endif %}
-          {% if payload.encyclopedia_entry.is_some() %}
+          {% if encyclopedia_html.is_some() %}
           <a href='#encyclopedia' class="nav-link px-3 py-1 rounded-full bg-slate-200 hover:bg-slate-300 text-slate-700">Encyclopedia</a>
           {% endif %}
         </nav>
@@ -1026,8 +1078,8 @@ fn xml_escape(input: &str) -> String {
           <div class="grid gap-4 md:grid-cols-3 row row-cols-1 row-cols-md-3 g-3">
             <div class="bg-white shadow rounded p-4 card card-body h-100 col">
               <p class="text-sm uppercase tracking-wide text-slate-500 mb-2">Sense coverage</p>
-              <p class="text-3xl font-bold text-slate-900">{{ payload.senses.len() }}</p>
-              <p class="text-sm text-slate-500 mb-0">documented sense{% if payload.senses.len() != 1 %}s{% endif %}</p>
+              <p class="text-3xl font-bold text-slate-900">{{ sense_count }}</p>
+              <p class="text-sm text-slate-500 mb-0">documented sense{% if sense_count != 1 %}s{% endif %}</p>
             </div>
             <div class="bg-white shadow rounded p-4 card card-body h-100 col">
               <p class="text-sm uppercase tracking-wide text-slate-500 mb-2">Parts of speech</p>
@@ -1046,7 +1098,7 @@ fn xml_escape(input: &str) -> String {
             </div>
             <div class="bg-white shadow rounded p-4 card card-body h-100 col">
               <p class="text-sm uppercase tracking-wide text-slate-500 mb-2">Encyclopedia</p>
-              {% if payload.encyclopedia_entry.is_some() %}
+              {% if encyclopedia_html.is_some() %}
               <p class="text-sm text-slate-600 mb-4">This lexeme includes a long-form encyclopedia entry.</p>
               <a href='#encyclopedia' class="{{ chrome.button_class }} inline-flex justify-center w-full md:w-auto">Jump to encyclopedia</a>
               {% else %}
@@ -1067,45 +1119,45 @@ fn xml_escape(input: &str) -> String {
         </section>
         {% endif %}
 
-        {% if payload.text.is_some() %}
+        {% if entry_text_html.is_some() %}
         <section id="entry-text">
           <h2 class="text-xl font-semibold mb-2">Entry Text</h2>
-          <div class="bg-white shadow rounded p-4 whitespace-pre-line">{{ payload.text.as_ref().unwrap() }}</div>
+          <div class="bg-white shadow rounded p-4 prose prose-slate max-w-none">{{ entry_text_html.as_ref().unwrap() }}</div>
         </section>
         {% endif %}
 
-        {% if payload.all_definitions.len() > 0 %}
+        {% if has_definitions %}
         <section id="definitions">
           <h2 class="text-xl font-semibold mb-2">Definitions</h2>
           <ul class="list-disc pl-6 space-y-1">
-            {% for definition in payload.all_definitions %}
-            <li>{{ definition }}</li>
+            {% for definition in definition_blocks %}
+            <li class="prose prose-slate max-w-none">{{ definition }}</li>
             {% endfor %}
           </ul>
         </section>
         {% endif %}
 
         <section id="senses">
-          <h2 class="text-xl font-semibold mb-2">Senses ({{ payload.senses.len() }})</h2>
+          <h2 class="text-xl font-semibold mb-2">Senses ({{ sense_count }})</h2>
           <div class="space-y-4">
-            {% for sense in payload.senses %}
+            {% for sense in senses %}
             <article class="bg-white shadow rounded p-4">
               <p class="text-sm text-slate-500 mb-1">
-                Sense #{{ sense.sense_index }}
-                {% if sense.part_of_speech.is_some() %}
-                  • {{ sense.part_of_speech.as_ref().unwrap() }}
+                Sense #{{ sense.payload.sense_index }}
+                {% if sense.payload.part_of_speech.is_some() %}
+                  • {{ sense.payload.part_of_speech.as_ref().unwrap() }}
                 {% endif %}
               </p>
-              <p class="font-medium mb-2">
-                {% if sense.definition.is_some() %}
-                  {{ sense.definition.as_ref().unwrap() }}
+              <div class="font-medium mb-2 prose prose-slate max-w-none">
+                {% if sense.definition_html.is_some() %}
+                  {{ sense.definition_html.as_ref().unwrap() }}
                 {% else %}
-                  Definition unavailable
+                  <p>Definition unavailable</p>
                 {% endif %}
-              </p>
-              {% if sense.synonyms.len() > 0 %}
+              </div>
+              {% if sense.payload.synonyms.len() > 0 %}
               <p><strong>Synonyms:</strong>
-                {% for syn in sense.synonyms %}
+                {% for syn in sense.payload.synonyms %}
                   {% if loop.first %}
                     {{ syn }}
                   {% else %}
@@ -1114,9 +1166,9 @@ fn xml_escape(input: &str) -> String {
                 {% endfor %}
               </p>
               {% endif %}
-              {% if sense.antonyms.len() > 0 %}
+              {% if sense.payload.antonyms.len() > 0 %}
               <p><strong>Antonyms:</strong>
-                {% for ant in sense.antonyms %}
+                {% for ant in sense.payload.antonyms %}
                   {% if loop.first %}
                     {{ ant }}
                   {% else %}
@@ -1125,9 +1177,9 @@ fn xml_escape(input: &str) -> String {
                 {% endfor %}
               </p>
               {% endif %}
-              {% if sense.examples.len() > 0 %}
+              {% if sense.payload.examples.len() > 0 %}
               <p><strong>Examples:</strong>
-                {% for example in sense.examples %}
+                {% for example in sense.payload.examples %}
                   {% if loop.first %}
                     {{ example }}
                   {% else %}
@@ -1141,10 +1193,10 @@ fn xml_escape(input: &str) -> String {
           </div>
         </section>
 
-        {% if payload.encyclopedia_entry.is_some() %}
+        {% if encyclopedia_html.is_some() %}
         <section id="encyclopedia">
           <h2 class="text-xl font-semibold mb-2">Encyclopedia Entry</h2>
-          <div class="bg-white shadow rounded p-4 whitespace-pre-line">{{ payload.encyclopedia_entry.as_ref().unwrap() }}</div>
+          <div class="bg-white shadow rounded p-4 prose prose-slate max-w-none">{{ encyclopedia_html.as_ref().unwrap() }}</div>
         </section>
         {% endif %}
       </div>
@@ -1158,6 +1210,12 @@ struct LexemeTemplate<'a> {
     payload: &'a LexemePayload,
     canonical_url: String,
     json_ld: SafeJson,
+    entry_text_html: Option<SafeHtml>,
+    encyclopedia_html: Option<SafeHtml>,
+    definition_blocks: Vec<SafeHtml>,
+    senses: Vec<SenseBlock<'a>>,
+    sense_count: usize,
+    has_definitions: bool,
 }
 
 #[derive(Template)]
