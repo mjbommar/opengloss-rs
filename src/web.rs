@@ -1490,5 +1490,28 @@ mod tests {
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("application/ld+json"));
+        assert!(html.contains("<section id=\"entry-text\">"));
+    }
+
+    #[tokio::test]
+    async fn lexeme_markdown_renders_html() {
+        let router = test_router();
+        let response = router
+            .oneshot(
+                Request::get("/lexeme?word=3d")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            html.contains("<h1"),
+            "markdown content should render as HTML headings"
+        );
     }
 }
