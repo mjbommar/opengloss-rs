@@ -1002,7 +1002,12 @@ fn xml_escape(input: &str) -> String {
 }
 
 fn markdown_options() -> MarkdownOptions {
-    MarkdownOptions::gfm()
+    let mut options = MarkdownOptions::gfm();
+    // Dataset entries embed trusted HTML (headings, tables, iframes), so allow it through.
+    options.compile.allow_dangerous_html = true;
+    options.compile.allow_dangerous_protocol = true;
+    options.compile.gfm_tagfilter = false;
+    options
 }
 
 fn render_markdown(input: Option<&str>) -> Option<String> {
@@ -1515,6 +1520,24 @@ mod tests {
         assert!(
             !html.contains("&lt;h1"),
             "markdown markup must not be HTML-escaped"
+        );
+    }
+
+    #[test]
+    fn render_markdown_str_allows_raw_html() {
+        let html = render_markdown_str("<h2>Inline</h2>").expect("rendered");
+        assert!(
+            html.contains("<h2>Inline</h2>"),
+            "raw HTML blocks should not be escaped"
+        );
+    }
+
+    #[test]
+    fn render_markdown_str_preserves_iframe_when_allowed() {
+        let html = render_markdown_str("<iframe src=\"https://example.com\"></iframe>").expect("rendered");
+        assert!(
+            html.contains("<iframe src=\"https://example.com\"></iframe>"),
+            "GFM tag filter must be disabled so embeddable HTML survives"
         );
     }
 }
