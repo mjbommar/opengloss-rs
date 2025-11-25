@@ -1478,6 +1478,7 @@ dependencies = [
  "mime",
  "once_cell",
  "parking_lot",
+ "percent-encoding",
  "rapidfuzz",
  "rayon",
  "rkyv",

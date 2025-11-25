@@ -135,6 +135,9 @@ struct ServeArgs {
     /// Address to bind the HTTP server to.
     #[arg(long, default_value = "127.0.0.1:8080")]
     addr: String,
+    /// Public base URL used for canonical links & sitemap entries.
+    #[arg(long)]
+    public_base: Option<String>,
     /// Render OpenAPI docs & JSON spec.
     #[arg(long, default_value_t = true)]
     openapi: bool,
@@ -423,10 +426,12 @@ fn handle_serve(args: ServeArgs) -> Result<(), Box<dyn Error>> {
         .addr
         .parse()
         .map_err(|_| user_error(format!("Invalid socket address {:?}", args.addr)))?;
+    let base_url = normalize_base_url(&addr, args.public_base.as_deref());
     let config = WebConfig {
         addr,
         enable_openapi: args.openapi,
         theme: args.theme.into(),
+        base_url,
     };
     tracing::info!(
         %config.addr,
@@ -456,6 +461,21 @@ fn init_web_logging() {
             .compact()
             .try_init();
     });
+}
+
+#[cfg(feature = "web")]
+fn normalize_base_url(addr: &SocketAddr, hint: Option<&str>) -> String {
+    let mut candidate = hint
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("http://{}", addr));
+    if !candidate.contains("://") {
+        candidate = format!("https://{candidate}");
+    }
+    while candidate.ends_with('/') {
+        candidate.pop();
+    }
+    candidate
 }
 
 fn resolve_entry(

@@ -41,6 +41,7 @@ static STRING_CACHE: Lazy<Vec<OnceLock<&'static str>>> = Lazy::new(|| {
     let len = data_store().strings.len();
     (0..len).map(|_| OnceLock::new()).collect()
 });
+static ALL_WORDS: OnceLock<Vec<(String, u32)>> = OnceLock::new();
 #[allow(clippy::type_complexity)]
 static SUBSTRING_CACHE: Lazy<Mutex<lru::LruCache<String, Vec<(String, u32)>>>> =
     Lazy::new(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(64).unwrap())));
@@ -174,6 +175,22 @@ impl LexemeIndex {
         let mut cache = SUBSTRING_CACHE.lock();
         cache.put(pattern.to_owned(), results.clone());
         results
+    }
+
+    /// Returns all lexemes (word + ID) in lexicographic order.
+    pub fn all_words() -> &'static [(String, u32)] {
+        ALL_WORDS
+            .get_or_init(|| {
+                let mut stream = LEXEME_MAP.stream();
+                let mut words = Vec::with_capacity(LEXEME_MAP.len());
+                while let Some((key, value)) = stream.next() {
+                    let word =
+                        String::from_utf8(key.to_vec()).expect("stored lexeme is valid UTF-8");
+                    words.push((word, value as u32));
+                }
+                words
+            })
+            .as_slice()
     }
 
     /// Performs a weighted fuzzy search over all entries.

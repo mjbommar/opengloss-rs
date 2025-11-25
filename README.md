@@ -138,9 +138,18 @@ cargo run --no-default-features --features "cli web" -- serve \
 - `--addr <ip:port>`: socket address to bind (defaults to `127.0.0.1:8080`).
 - `--theme tailwind|bootstrap`: pick the CSS framework for the HTML explorer.
 - `--openapi`: reserved for future OpenAPI docs; keep it enabled for forwards compatibility.
+- `--public-base <url>`: public origin used for canonical links, JSON-LD metadata, and sitemap
+  entries (defaults to `http://<addr>`).
 
 Logging is wired up via `tracing_subscriber` with an `info`-level default. Override it with
 `RUST_LOG`, e.g. `RUST_LOG=debug,tower_http=trace cargo run --no-default-features --features "cli web" -- serve`.
+
+### Prefix index & sitemap
+
+- `GET /index?letters=<n>&prefix=<abc>`: interactive lexeme index that groups every entry by
+  configurable prefix depth (1–4 letters) and shows the first 750 matches for the selected prefix.
+- `GET /sitemap.xml`: auto-generated sitemap with canonical URLs for every lexeme plus the home and
+  index pages. Point search consoles at this endpoint once you host the explorer publicly.
 
 ### HTML explorer
 
@@ -148,6 +157,11 @@ Logging is wired up via `tracing_subscriber` with an `info`-level default. Overr
 - `GET /lexeme?word=<word>` or `?id=<lexeme_id>`: rendered entry view.
 - `GET /search?q=<query>&mode=fuzzy|substring&limit=<n>`: table of search hits with deep links to
   `/lexeme`.
+- `GET /index`: browsable prefix index described above.
+
+Lexeme pages now open with an overview strip that surfaces how many senses exist, the
+part-of-speech distribution, and whether an encyclopedia article is available, plus quick navigation
+chips to jump straight to the entry text, senses, or encyclopedia section.
 
 ### JSON API
 
@@ -173,6 +187,14 @@ open http://127.0.0.1:8090/lexeme?word=algorithm
 The Axum router also exposes `/lexeme` and `/search` in HTML, so you can point browsers at the same
 instance you use for API calls. Responses are automatically gzip/zstd-compressed via
 `tower-http::CompressionLayer`.
+
+### Structured data
+
+Every lexeme page now embeds JSON-LD that describes the word as a Schema.org `DefinedTerm`, complete
+with breadcrumbs, synonyms, and encyclopedia text when available. Search pages emit
+`SearchResultsPage` metadata, and the home page advertises a `SearchAction` so Google and friends can
+deep-link into the explorer. Set `--public-base` (or `PUBLIC_BASE` once you add env plumbing) to the
+canonical origin before hosting the service so the sitemap and JSON-LD point at the correct domain.
 
 ## Implementation notes
 
