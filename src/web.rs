@@ -27,7 +27,6 @@ const MAX_PREFIX_LEVEL: usize = 4;
 const MAX_WORDS_DISPLAY: usize = 750;
 type SafeMarkup = MarkupDisplay<HtmlEscaper, String>;
 type SafeJson = SafeMarkup;
-type SafeHtml = SafeMarkup;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -557,7 +556,7 @@ struct IndexPagePayload<'a> {
 
 struct SenseBlock<'a> {
     payload: &'a SensePayload,
-    definition_html: Option<SafeHtml>,
+    definition_html: Option<String>,
 }
 
 impl LexemePayload {
@@ -1006,21 +1005,21 @@ fn markdown_options() -> MarkdownOptions {
     MarkdownOptions::gfm()
 }
 
-fn render_markdown(input: Option<&str>) -> Option<SafeHtml> {
+fn render_markdown(input: Option<&str>) -> Option<String> {
     input.and_then(render_markdown_str)
 }
 
-fn render_markdown_str(input: &str) -> Option<SafeHtml> {
+fn render_markdown_str(input: &str) -> Option<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return None;
     }
     let options = markdown_options();
     let html = to_html_with_options(trimmed, &options).unwrap_or_else(|_| trimmed.to_string());
-    Some(MarkupDisplay::new_safe(html, HtmlEscaper))
+    Some(html)
 }
 
-fn render_markdown_list(items: &[String]) -> Vec<SafeHtml> {
+fn render_markdown_list(items: &[String]) -> Vec<String> {
     items
         .iter()
         .filter_map(|item| render_markdown_str(item))
@@ -1123,7 +1122,7 @@ fn render_markdown_list(items: &[String]) -> Vec<SafeHtml> {
         {% if entry_text_html.is_some() %}
         <section id="entry-text">
           <h2 class="text-xl font-semibold mb-2">Entry Text</h2>
-          <div class="bg-white shadow rounded p-4 prose prose-slate max-w-none">{{ entry_text_html.as_ref().unwrap() }}</div>
+          <div class="bg-white shadow rounded p-4 prose prose-slate max-w-none">{{ entry_text_html.as_ref().unwrap()|safe }}</div>
         </section>
         {% endif %}
 
@@ -1132,7 +1131,7 @@ fn render_markdown_list(items: &[String]) -> Vec<SafeHtml> {
           <h2 class="text-xl font-semibold mb-2">Definitions</h2>
           <ul class="list-disc pl-6 space-y-1">
             {% for definition in definition_blocks %}
-            <li class="prose prose-slate max-w-none">{{ definition }}</li>
+            <li class="prose prose-slate max-w-none">{{ definition|safe }}</li>
             {% endfor %}
           </ul>
         </section>
@@ -1151,7 +1150,7 @@ fn render_markdown_list(items: &[String]) -> Vec<SafeHtml> {
               </p>
               <div class="font-medium mb-2 prose prose-slate max-w-none">
                 {% if sense.definition_html.is_some() %}
-                  {{ sense.definition_html.as_ref().unwrap() }}
+                  {{ sense.definition_html.as_ref().unwrap()|safe }}
                 {% else %}
                   <p>Definition unavailable</p>
                 {% endif %}
@@ -1197,7 +1196,7 @@ fn render_markdown_list(items: &[String]) -> Vec<SafeHtml> {
         {% if encyclopedia_html.is_some() %}
         <section id="encyclopedia">
           <h2 class="text-xl font-semibold mb-2">Encyclopedia Entry</h2>
-          <div class="bg-white shadow rounded p-4 prose prose-slate max-w-none">{{ encyclopedia_html.as_ref().unwrap() }}</div>
+          <div class="bg-white shadow rounded p-4 prose prose-slate max-w-none">{{ encyclopedia_html.as_ref().unwrap()|safe }}</div>
         </section>
         {% endif %}
       </div>
@@ -1211,9 +1210,9 @@ struct LexemeTemplate<'a> {
     payload: &'a LexemePayload,
     canonical_url: String,
     json_ld: SafeJson,
-    entry_text_html: Option<SafeHtml>,
-    encyclopedia_html: Option<SafeHtml>,
-    definition_blocks: Vec<SafeHtml>,
+    entry_text_html: Option<String>,
+    encyclopedia_html: Option<String>,
+    definition_blocks: Vec<String>,
     senses: Vec<SenseBlock<'a>>,
     sense_count: usize,
     has_definitions: bool,
@@ -1512,6 +1511,10 @@ mod tests {
         assert!(
             html.contains("<h1"),
             "markdown content should render as HTML headings"
+        );
+        assert!(
+            !html.contains("&lt;h1"),
+            "markdown markup must not be HTML-escaped"
         );
     }
 }
