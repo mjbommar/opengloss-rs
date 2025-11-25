@@ -31,40 +31,49 @@ The Hugging Face files are **not** committed to git. Export them locally before 
 
 If you change the dataset or script output, rebuild to regenerate the embedded store.
 
-## Features & CLI
+## Running the CLI
 
-- `cli` (default): pulls in the Clap-based command-line interface. Disable via
-  `cargo build --no-default-features` if you only need the library.
+The `cli` feature is enabled by default. Build normally (`cargo run -- <args>`) to use the command
+line tooling, or disable it with `cargo build --no-default-features` when you only need the library.
+Every subcommand accepts the global `--json` flag to emit machine-readable output instead of the
+default column/table views.
 
-When enabled, the CLI provides rich output or JSON via `--json`:
+### Quick start
 
 ```bash
-cargo run -- lexeme get 3d "a b c labels"
-cargo run -- lexeme prefix geo --limit 5
-cargo run -- lexeme search biodegradable --mode fuzzy --field word --field definitions
-cargo run -- lexeme search "general relativity" --explain
-cargo run -- --json lexeme prefix bio
-cargo run -- lexeme show 3d
-cargo run -- --json lexeme show 42 --by-id
-cargo run -- lexeme graph algorithm --depth 2 --format tree
-cargo run -- --json lexeme graph dog --format json
+# Discover all commands/flags
+cargo run -- --help
 
-# Launch the web explorer (feature-gated)
-cargo run --no-default-features --features "cli web" -- serve --addr 127.0.0.1:8090
+# Show help for a specific subcommand
+cargo run -- lexeme search --help
 ```
 
-With the `web` feature enabled, the binary exposes:
+### Subcommands at a glance
 
-- `GET /healthz` – readiness probe.
-- `GET /api/lexeme?word=dog` or `?id=123` – JSON payload for a lexeme.
-- `GET /api/search?q=dog&mode=fuzzy` – JSON search results (substring or fuzzy).
-- `GET /lexeme?word=dog` & `GET /search?q=dog` – server-rendered HTML using Tailwind or Bootstrap, selectable via `--theme`.
+| Command | Description | Example |
+| --- | --- | --- |
+| `lexeme get <word>...` | Exact lookup of one or more surface forms, returning lexeme IDs. | `cargo run -- lexeme get "general relativity" tensor` |
+| `lexeme prefix <prefix>` | Prefix lookup backed by the compiled FST. | `cargo run -- lexeme prefix geo --limit 5` |
+| `lexeme search <pattern>` | Substring or fuzzy search across words, definitions, synonyms, entry text, and encyclopedia content. | `cargo run -- lexeme search biodegradable --mode fuzzy --field word --field definitions` |
+| `lexeme show <query>` | Render the full entry (definitions, senses, encyclopedia text, etymology). | `cargo run -- lexeme show 3d` / `cargo run -- --json lexeme show 42 --by-id` |
+| `lexeme graph <query>` | Traverse relation edges (synonym/antonym/hypernym/hyponym) and dump them as a tree, JSON, or GraphViz DOT. | `cargo run -- lexeme graph algorithm --depth 2 --format tree` |
 
-`web-openapi` will later surface OpenAPI docs and Swagger UI once those routes are implemented.
+### Lookup, prefix, and substring helpers
 
-### Weighted search
+```bash
+# Exact lookups
+cargo run -- lexeme get "a b c labels" "machine learning"
 
-`lexeme search` defaults to a fuzzy RapidFuzz-backed ranking that blends matches across the word,
+# Prefix expansion (limit defaults to 10)
+cargo run -- lexeme prefix bio --limit 20
+
+# Substring search when you do not need fuzziness
+cargo run -- lexeme search algorithm --mode substring --limit 15
+```
+
+### Weighted fuzzy search
+
+`lexeme search` defaults to a RapidFuzz-backed ranking that blends matches across the word,
 definitions, synonyms, entry text, and encyclopedia content. You can toggle fields or adjust their
 weights directly:
 
@@ -77,9 +86,8 @@ cargo run -- lexeme search bio --mode substring
 cargo run -- lexeme search tensor --explain --limit 5
 ```
 
-Use `cargo run -- lexeme search --help` to see all knobs (field list, per-field weights, min score).
-
-Example JSON output:
+Run `cargo run -- lexeme search --help` for the full list of knobs (field list, per-field weights,
+min score, cache diagnostics). The JSON mode is convenient when calling the binary from scripts:
 
 ```bash
 cargo run -- --json lexeme get sphere
@@ -90,6 +98,78 @@ cargo run -- --json lexeme get sphere
 #   }
 # ]
 ```
+
+### Graph traversal & visualization
+
+The `lexeme graph` subcommand walks the synonym/antonym/hypernym/hyponym edges with a configurable
+depth, relation filter, and node/edge caps. Output modes:
+
+- `--format tree` (default): indented textual tree rooted at the query lexeme.
+- `--format json`: structured payload with nodes/edges for downstream tooling.
+- `--format dot`: GraphViz-compatible DOT file. Pipe it into `dot -Tpng` for quick diagrams.
+
+Example:
+
+```bash
+cargo run -- lexeme graph "machine learning" --depth 2 --relation synonym --relation hypernym
+# or visualize:
+cargo run -- lexeme graph "machine learning" --depth 2 --format dot | dot -Tpng -o graph.png
+```
+
+### Launching searches programmatically
+
+All lookup-oriented subcommands respect `--json`, so you can integrate them into scripts without
+parsing text tables. Combine that with `--limit`, `--mode`, and the weight flags to shape the API
+surface you need.
+
+## Web server & HTTP API
+
+Enable the `web` feature to expose an Axum/Tokio HTTP server alongside the CLI:
+
+```bash
+cargo run --no-default-features --features "cli web" -- serve \
+  --addr 127.0.0.1:8090 \
+  --theme tailwind \
+  --openapi true
+```
+
+`serve` options:
+
+- `--addr <ip:port>`: socket address to bind (defaults to `127.0.0.1:8080`).
+- `--theme tailwind|bootstrap`: pick the CSS framework for the HTML explorer.
+- `--openapi`: reserved for future OpenAPI docs; keep it enabled for forwards compatibility.
+
+### HTML explorer
+
+- `GET /`: landing page with quick links.
+- `GET /lexeme?word=<word>` or `?id=<lexeme_id>`: rendered entry view.
+- `GET /search?q=<query>&mode=fuzzy|substring&limit=<n>`: table of search hits with deep links to
+  `/lexeme`.
+
+### JSON API
+
+| Method | Path | Query parameters | Description |
+| --- | --- | --- | --- |
+| `GET` | `/api/lexeme` | `word=<string>` **or** `id=<u32>` | Returns the full `LexemePayload` (entry metadata, senses, relations, encyclopedia text). |
+| `GET` | `/api/search` | `q=<string>&mode=fuzzy|substring&limit=1..100` | Returns `results[]` with lexeme IDs, forms, and optional scores (for fuzzy mode). |
+| `GET` | `/healthz` | *(none)* | Simple readiness probe emitting `{ "status": "ok" }`. |
+
+Sample interactions:
+
+```bash
+# Fetch an entry
+curl 'http://127.0.0.1:8090/api/lexeme?word=dog' | jq '.word, .lexeme_id'
+
+# Run a fuzzy search and capture scores
+curl 'http://127.0.0.1:8090/api/search?q=gravitation&mode=fuzzy&limit=5' | jq '.results[] | {word, score}'
+
+# HTML endpoints for browsers
+open http://127.0.0.1:8090/lexeme?word=algorithm
+```
+
+The Axum router also exposes `/lexeme` and `/search` in HTML, so you can point browsers at the same
+instance you use for API calls. Responses are automatically gzip/zstd-compressed via
+`tower-http::CompressionLayer`.
 
 ## Implementation notes
 
@@ -112,23 +192,6 @@ cargo run -- --json lexeme get sphere
   demand.
 - Neighbor relations (synonyms, antonyms, hypernyms, hyponyms) are resolved to lexeme IDs ahead of
   time, enabling fast lookups/graph traversals without repeated string matching.
-
-### Graph traversal & visualization
-
-The `lexeme graph` subcommand walks the synonym/antonym/hypernym/hyponym edges with a configurable
-depth, relation filter, and node/edge caps. Output modes:
-
-- `--format tree` (default): indented textual tree rooted at the query lexeme.
-- `--format json`: structured payload with nodes/edges for downstream tooling.
-- `--format dot`: GraphViz-compatible DOT file. Pipe it into `dot -Tpng` for quick diagrams.
-
-Example:
-
-```bash
-cargo run -- lexeme graph "machine learning" --depth 2 --relation synonym --relation hypernym
-# or visualize:
-cargo run -- lexeme graph "machine learning" --depth 2 --format dot | dot -Tpng -o graph.png
-```
 
 ## Search scoring
 
