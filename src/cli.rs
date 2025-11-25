@@ -16,9 +16,13 @@ use opengloss_rs::{
 use serde_json::json;
 #[cfg(feature = "web")]
 use std::net::SocketAddr;
+#[cfg(feature = "web")]
+use std::sync::OnceLock;
 use termimad::{FmtText, MadSkin, terminal_size};
 #[cfg(feature = "web")]
 use tokio::runtime::Builder as TokioRuntimeBuilder;
+#[cfg(feature = "web")]
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Parser, Debug)]
 #[command(name = "opengloss-rs", about = "Explore OpenGloss data", version)]
@@ -414,6 +418,7 @@ fn handle_graph(
 
 #[cfg(feature = "web")]
 fn handle_serve(args: ServeArgs) -> Result<(), Box<dyn Error>> {
+    init_web_logging();
     let addr: SocketAddr = args
         .addr
         .parse()
@@ -423,11 +428,34 @@ fn handle_serve(args: ServeArgs) -> Result<(), Box<dyn Error>> {
         enable_openapi: args.openapi,
         theme: args.theme.into(),
     };
+    tracing::info!(
+        %config.addr,
+        openapi = config.enable_openapi,
+        theme = ?config.theme,
+        "Starting OpenGloss web server"
+    );
     let runtime = TokioRuntimeBuilder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(web::serve(config))?;
+    tracing::info!("OpenGloss web server shut down");
     Ok(())
+}
+
+#[cfg(feature = "web")]
+static WEB_LOGGER: OnceLock<()> = OnceLock::new();
+
+#[cfg(feature = "web")]
+fn init_web_logging() {
+    WEB_LOGGER.get_or_init(|| {
+        let env_filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info,tower_http=info"));
+        let _ = fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .compact()
+            .try_init();
+    });
 }
 
 fn resolve_entry(

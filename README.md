@@ -139,6 +139,9 @@ cargo run --no-default-features --features "cli web" -- serve \
 - `--theme tailwind|bootstrap`: pick the CSS framework for the HTML explorer.
 - `--openapi`: reserved for future OpenAPI docs; keep it enabled for forwards compatibility.
 
+Logging is wired up via `tracing_subscriber` with an `info`-level default. Override it with
+`RUST_LOG`, e.g. `RUST_LOG=debug,tower_http=trace cargo run --no-default-features --features "cli web" -- serve`.
+
 ### HTML explorer
 
 - `GET /`: landing page with quick links.

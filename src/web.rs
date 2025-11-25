@@ -16,6 +16,7 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use tower_http::compression::CompressionLayer;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::info;
 
 type SharedState = Arc<AppState>;
 
@@ -133,10 +134,17 @@ pub async fn serve(config: WebConfig) -> Result<(), WebError> {
         theme: config.theme,
     });
     let router = build_router(state, config.enable_openapi);
+    info!(
+        %config.addr,
+        theme = ?config.theme,
+        openapi = config.enable_openapi,
+        "Binding HTTP listener"
+    );
     let listener = TcpListener::bind(config.addr).await?;
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    info!("HTTP server exited");
     Ok(())
 }
 
