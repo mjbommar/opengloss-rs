@@ -3,11 +3,6 @@ mod data;
 #[cfg(feature = "web")]
 pub mod web;
 
-#[cfg(feature = "web")]
-pub mod filters {
-    pub use askama::filters::safe;
-}
-
 use data::{
     ArchivedCompressedTextStore, ArchivedDataStore, ArchivedEntryRecord, ArchivedPackedStrings,
     ArchivedRange, ArchivedSenseRecord, ArchivedStringId, ArchivedTextId, ArchivedU32,
