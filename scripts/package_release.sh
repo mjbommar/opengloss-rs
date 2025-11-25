@@ -23,8 +23,9 @@ staging_dir="$dist_dir/opengloss-rs-${version}-${target_triple}"
 rm -rf "$staging_dir"
 mkdir -p "$staging_dir"
 
-echo "Building release binary..." >&2
-cargo build --release
+build_features="${CARGO_FEATURES:-cli web}"
+echo "Building release binary with features: ${build_features}" >&2
+cargo build --release --no-default-features --features "${build_features}"
 
 echo "Collecting artifacts..." >&2
 cp target/release/opengloss-rs "$staging_dir/"

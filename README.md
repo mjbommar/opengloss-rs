@@ -224,7 +224,8 @@ the initial lookup. Subsequent queries run without additional allocation or deco
 
 ## Packaging releases
 
-Use the helper script to produce GitHub-friendly artifacts (tarball + SHA256):
+Use the helper script to produce GitHub-friendly artifacts (tarball + SHA256). It compiles the binary
+with both `cli` and `web` features so the packaged executable always exposes the `serve` subcommand.
 
 ```bash
 scripts/package_release.sh v0.1.0
@@ -233,5 +234,6 @@ ls dist/
 
 The archive currently includes the `opengloss-rs` binary, README, and the export script. Upload the
 tarball (`dist/opengloss-rs-<version>-<target>.tar.zst`) and its `.sha256` to a GitHub Release.
+Set `CARGO_FEATURES` if you need a different feature set (e.g., `CARGO_FEATURES="cli"`).
 See [RELEASING.md](RELEASING.md) for a full walkthrough, including recommended checks before
 publishing.
