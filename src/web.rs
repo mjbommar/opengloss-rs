@@ -307,7 +307,6 @@ async fn lexeme_html(
             let payload = LexemePayload::from_entry(&entry);
             let json_ld =
                 MarkupDisplay::new_safe(lexeme_json_ld(&entry, &state.base_url), HtmlEscaper);
-            let entry_text_html = render_markdown(payload.text.as_deref());
             let encyclopedia_html = render_markdown(payload.encyclopedia_entry.as_deref());
             let definition_blocks = render_markdown_list(&payload.all_definitions);
             let has_definitions = !definition_blocks.is_empty();
@@ -325,7 +324,6 @@ async fn lexeme_html(
                 payload: &payload,
                 canonical_url: absolute_lexeme_url(&state.base_url, entry.word()),
                 json_ld,
-                entry_text_html,
                 encyclopedia_html,
                 definition_blocks,
                 senses,
@@ -1065,9 +1063,6 @@ fn render_markdown_list(items: &[String]) -> Vec<String> {
           {% if payload.parts_of_speech.len() > 0 %}
           <a href='#parts-of-speech' class="nav-link px-3 py-1 rounded-full bg-slate-200 hover:bg-slate-300 text-slate-700">Parts of speech</a>
           {% endif %}
-          {% if entry_text_html.is_some() %}
-          <a href='#entry-text' class="nav-link px-3 py-1 rounded-full bg-slate-200 hover:bg-slate-300 text-slate-700">Entry text</a>
-          {% endif %}
           {% if has_definitions %}
           <a href='#definitions' class="nav-link px-3 py-1 rounded-full bg-slate-200 hover:bg-slate-300 text-slate-700">Definitions</a>
           {% endif %}
@@ -1121,13 +1116,6 @@ fn render_markdown_list(items: &[String]) -> Vec<String> {
             <span class="px-3 py-1 rounded-full bg-slate-200 text-sm">{{ pos }}</span>
             {% endfor %}
           </div>
-        </section>
-        {% endif %}
-
-        {% if entry_text_html.is_some() %}
-        <section id="entry-text">
-          <h2 class="text-xl font-semibold mb-2">Entry Text</h2>
-          <div class="bg-white shadow rounded p-4 prose prose-slate max-w-none">{{ entry_text_html.as_ref().unwrap()|safe }}</div>
         </section>
         {% endif %}
 
@@ -1215,7 +1203,6 @@ struct LexemeTemplate<'a> {
     payload: &'a LexemePayload,
     canonical_url: String,
     json_ld: SafeJson,
-    entry_text_html: Option<String>,
     encyclopedia_html: Option<String>,
     definition_blocks: Vec<String>,
     senses: Vec<SenseBlock<'a>>,
@@ -1494,7 +1481,7 @@ mod tests {
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("application/ld+json"));
-        assert!(html.contains("<section id=\"entry-text\">"));
+        assert!(html.contains("<section id=\"definitions\">"));
     }
 
     #[tokio::test]
@@ -1516,6 +1503,10 @@ mod tests {
         assert!(
             html.contains("<h1"),
             "markdown content should render as HTML headings"
+        );
+        assert!(
+            html.contains("<section id=\"definitions\">"),
+            "definitions section should be present"
         );
         assert!(
             !html.contains("&lt;h1"),

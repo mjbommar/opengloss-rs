@@ -161,7 +161,7 @@ Logging is wired up via `tracing_subscriber` with an `info`-level default. Overr
 
 Lexeme pages now open with an overview strip that surfaces how many senses exist, the
 part-of-speech distribution, and whether an encyclopedia article is available, plus quick navigation
-chips to jump straight to the entry text, senses, or encyclopedia section.
+chips to jump straight to the definitions, senses, or encyclopedia section.
 
 Entry bodies, aggregated definitions, and encyclopedia articles are authored in Markdown inside the
 dataset; the web explorer renders them to HTML via [`markdown-rs`](https://github.com/wooorm/markdown-rs)
