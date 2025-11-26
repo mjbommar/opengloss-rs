@@ -33,6 +33,12 @@
   - [x] Add integration tests for `/api/*`, `/lexeme`, `/index`, and markdown rendering.
   - [ ] Extend benches / add perf tests for trie/typeahead + web handlers if regressions appear.
 
+- [x] **Telemetry, feedback, and engagement**
+  - [x] Add in-memory telemetry for lexeme views, section votes, relation clicks, and issue reports with periodic JSONL snapshots under `data/telemetry/`.
+  - [x] Surface Lexeme of the Day, Seven Senses Challenge, relation puzzles, trending lists, and streak messaging on the home page.
+  - [x] Add per-section thumbs-up/down controls, community confidence badges, and a “Quality & feedback” issue form on lexeme pages.
+  - [x] Expose public endpoints for the feedback/reporting pipeline (`/api/feedback/*`), analytics (`/api/telemetry/relation-click`, `/api/analytics/trending`), and games (`/api/fun/*`).
+
 - [ ] **Deployment polish**
   - [x] Update release packaging for web builds (full-feature tarball + checksum).
   - [ ] Add docker/systemd guidance and sample configs.

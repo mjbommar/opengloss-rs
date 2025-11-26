@@ -1,6 +1,6 @@
 [package]
 name = "opengloss-rs"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 authors = ["Michael Bommarito <michael.bommarito@gmail.com>"]
 
@@ -18,8 +18,10 @@ rapidfuzz = "0.5"
 rayon = "1.11"
 lru = "0.12"
 parking_lot = "0.12"
+rand = { version = "0.8", features = ["std", "std_rng", "small_rng"] }
 tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "signal"], optional = true }
 axum = { version = "0.7", features = ["macros", "json"], optional = true }
+cookie = { version = "0.18", optional = true }
 tower-http = { version = "0.5", features = ["trace", "compression-full", "cors", "propagate-header", "util", "fs"], optional = true }
 askama = { version = "0.12", features = ["with-axum"], optional = true }
 askama_axum = { version = "0.3", optional = true }
@@ -61,6 +63,7 @@ web = [
     "markdown",
     "tracing",
     "tracing-subscriber",
+    "cookie",
 ]
 web-openapi = ["web", "utoipa-swagger-ui"]
 

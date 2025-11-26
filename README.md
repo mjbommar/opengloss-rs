@@ -142,6 +142,8 @@ cargo run --no-default-features --features "cli web" -- serve \
 - `--openapi`: reserved for future OpenAPI docs; keep it enabled for forwards compatibility.
 - `--public-base <url>`: public origin used for canonical links, JSON-LD metadata, and sitemap
   entries (defaults to `http://<addr>`).
+- `--telemetry-log <path>`: optional JSONL file that receives periodic snapshots of vote/report/view
+  telemetry (defaults to `data/telemetry/telemetry-log.jsonl`).
 
 Logging is wired up via `tracing_subscriber` with an `info`-level default. Override it with
 `RUST_LOG`, e.g. `RUST_LOG=debug,tower_http=trace cargo run --no-default-features --features "cli web" -- serve`.
@@ -164,21 +166,27 @@ Logging is wired up via `tracing_subscriber` with an `info`-level default. Overr
   `/lexeme`.
 - `GET /index`: browsable prefix index described above.
 - `/` now ships with a custom type-ahead dropdown backed by the embedded trie so the first dozen
-  matches stream in as you type (with a plain `<form>` fallback). Quick links jump to a curated
-  example (`farm`), the prefix index, or a “Random word” button wired to `/random`, which redirects
-  to a fresh lexeme on each click.
+  matches stream in as you type (with a plain `<form>` fallback). The hero also spotlights the
+  Lexeme of the Day, a Seven Senses Challenge (random relation path puzzle), a “Surprise me” link to
+  `/random`, and a “Community pulse” list driven by live telemetry. If you’ve opened other entries
+  recently you’ll also see your personal streak (“You’ve explored 4 new words today — 2-day streak”).
 
-Lexeme pages now open with an overview strip that surfaces how many senses exist, the
-part-of-speech distribution, and whether an encyclopedia article is available, plus quick navigation
-chips to jump straight to the senses or encyclopedia section. Every synonym/antonym/hypernym/hyponym
-is rendered as a muted chip that links to the corresponding `/lexeme?word=...` view, making it easy
-to traverse the network.
-Parts-of-speech badges use subtle color coding (nouns, verbs, adjectives, etc.) so readers can spot the
-distribution at a glance.
+Lexeme pages open with an overview strip that surfaces sense counts, part-of-speech distributions,
+encyclopedia coverage, and your current streak. Every synonym/antonym/hypernym/hyponym is rendered
+as a muted chip that links to the corresponding `/lexeme?word=...` view, and the chips now emit
+anonymous click telemetry so the “Community explorer” section can highlight where other readers
+jumped next. Parts-of-speech badges still use subtle color coding (nouns, verbs, adjectives, etc.)
+so readers can spot the distribution at a glance.
+
+Each definition, relation list, and encyclopedia article now has friendly 👍/👎 buttons plus a
+“Quality & feedback” form for quick issue reports (“duplicate word”, “broken relation”, “offensive
+content”, etc.). Once a section accrues a few votes, confidence badges (“Community confidence: 92%
+positive”) appear automatically. These votes and reports are cached in memory and occasionally
+snapshotted to `data/telemetry/telemetry-log.jsonl` (ignored by git) so you can review them offline.
 
 Entry bodies, aggregated definitions, and encyclopedia articles are authored in Markdown inside the
 dataset; the web explorer renders them to HTML via [`markdown-rs`](https://github.com/wooorm/markdown-rs)
-so headings, emphasis, tables, and lists survive intact.
+so headings, emphasis, tables, and lists survive intact without client-side rendering.
 
 ### JSON API
 
@@ -188,6 +196,12 @@ so headings, emphasis, tables, and lists survive intact.
 | `GET` | `/api/search` | `q=<string>&mode=fuzzy|substring&limit=1..100` | Returns `results[]` with lexeme IDs, forms, and optional scores (for fuzzy mode). |
 | `GET` | `/api/typeahead` | `q=<string>&mode=prefix|substring&limit=1..50` | Lightweight suggestions endpoint backed by the lexeme trie, suitable for type-ahead inputs. |
 | `GET` | `/healthz` | *(none)* | Simple readiness probe emitting `{ "status": "ok" }`. |
+| `POST` | `/api/feedback/rate` | JSON body with `lexeme_id`, `vote`, and a `target` descriptor | Records thumbs-up/down votes for senses, relation groups, or encyclopedia articles. |
+| `POST` | `/api/feedback/report` | JSON body with `lexeme_id`, `reason`, and optional `note` | Adds lightweight issue reports to the telemetry queue. |
+| `POST` | `/api/telemetry/relation-click` | JSON body `{ lexeme_id, target_word }` | Internal hook used by the UI to log relation chip navigation. |
+| `GET` | `/api/analytics/trending` | *(none)* | Returns the most-viewed lexemes according to the in-memory telemetry tracker. |
+| `GET` | `/api/fun/seven-senses` | *(none)* | Exposes the current Seven Senses Challenge payload (start/end words + path). |
+| `GET` | `/api/fun/relation-puzzle` | *(none)* | Returns the relation puzzle (hidden synonym hint) shown on the home page. |
 
 Sample interactions:
 
@@ -204,7 +218,9 @@ open http://127.0.0.1:8090/lexeme?word=algorithm
 
 The Axum router also exposes `/lexeme` and `/search` in HTML, so you can point browsers at the same
 instance you use for API calls. Responses are automatically gzip/zstd-compressed via
-`tower-http::CompressionLayer`.
+`tower-http::CompressionLayer`. Feedback/reporting endpoints share the same telemetry backing as the
+home-page widgets, so you can build dashboards or QA tooling on top of the live vote/feed data
+without adding another database.
 
 ### Structured data
 

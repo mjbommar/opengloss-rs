@@ -1,13 +1,19 @@
-use crate::{LexemeEntry, LexemeIndex, SearchConfig};
+use crate::telemetry::{
+    ChallengeCard, IssueKind, IssueReportRequest, LexemeFeedbackBundle, RelationPuzzle, SectionKey,
+    SectionKind, SessionProgress, SpotlightLexeme, Telemetry, TrendingLexeme, VoteDirection,
+    describe_ratio, generate_session_id,
+};
+use crate::{LexemeEntry, LexemeIndex, RelationKind, SearchConfig};
 use askama::Html as HtmlEscaper;
 use askama::{MarkupDisplay, Template};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::get,
+    routing::{get, post},
 };
+use cookie::{Cookie, SameSite};
 use markdown::{Options as MarkdownOptions, to_html_with_options};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
@@ -15,6 +21,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -27,19 +34,63 @@ type SharedState = Arc<AppState>;
 const MAX_PREFIX_LEVEL: usize = 4;
 const MAX_WORDS_DISPLAY: usize = 750;
 const SITEMAP_BUCKETS: [&str; 27] = [
-    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r",
-    "s", "t", "u", "v", "w", "x", "y", "z", "other",
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s",
+    "t", "u", "v", "w", "x", "y", "z", "other",
 ];
 const TYPEAHEAD_DEFAULT_LIMIT: usize = 12;
 const TYPEAHEAD_MAX_LIMIT: usize = 50;
+const SESSION_COOKIE: &str = "opengloss_session";
 type SafeMarkup = MarkupDisplay<HtmlEscaper, String>;
 type SafeJson = SafeMarkup;
+
+struct SessionHandle {
+    id: String,
+    needs_set: bool,
+}
+
+impl SessionHandle {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        if let Some(existing) = cookie_value(headers, SESSION_COOKIE) {
+            Self {
+                id: existing,
+                needs_set: false,
+            }
+        } else {
+            Self {
+                id: generate_session_id(),
+                needs_set: true,
+            }
+        }
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn into_response<R: IntoResponse>(self, response: R) -> Response {
+        let mut response = response.into_response();
+        if self.needs_set {
+            if let Some(value) = build_session_cookie_header(&self.id) {
+                response.headers_mut().append(header::SET_COOKIE, value);
+            }
+        }
+        response
+    }
+}
+
+struct HomeHighlights {
+    spotlight: Option<SpotlightLexeme>,
+    trending: Vec<TrendingLexeme>,
+    challenge: Option<ChallengeCard>,
+    puzzle: Option<RelationPuzzle>,
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub default_search: SearchConfig,
     pub theme: WebTheme,
     pub base_url: String,
+    pub telemetry: Telemetry,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
@@ -68,7 +119,6 @@ struct Chrome {
     eyebrow_class: &'static str,
     headline_class: &'static str,
     lede_class: &'static str,
-    cta_group_class: &'static str,
     button_class: &'static str,
     table_row_class: &'static str,
 }
@@ -85,7 +135,6 @@ impl Chrome {
                 eyebrow_class: "uppercase tracking-wide text-sm text-slate-500",
                 headline_class: "text-4xl font-extrabold tracking-tight",
                 lede_class: "text-lg text-slate-600",
-                cta_group_class: "flex flex-wrap gap-3",
                 button_class: "inline-flex items-center rounded-md bg-slate-900 px-4 py-2 text-white font-semibold shadow hover:bg-slate-800 transition-colors",
                 table_row_class: "border-b border-slate-200",
             },
@@ -98,7 +147,6 @@ impl Chrome {
                 eyebrow_class: "text-uppercase text-muted mb-2",
                 headline_class: "display-5 fw-bold",
                 lede_class: "lead mb-4",
-                cta_group_class: "d-flex flex-wrap gap-3",
                 button_class: "btn btn-primary btn-lg px-4 py-2",
                 table_row_class: "",
             },
@@ -112,6 +160,7 @@ pub struct WebConfig {
     pub enable_openapi: bool,
     pub theme: WebTheme,
     pub base_url: String,
+    pub telemetry_path: Option<PathBuf>,
 }
 
 impl Default for WebConfig {
@@ -121,6 +170,7 @@ impl Default for WebConfig {
             enable_openapi: true,
             theme: WebTheme::default(),
             base_url: "http://127.0.0.1:8080".to_string(),
+            telemetry_path: Some(PathBuf::from("data/telemetry/telemetry-log.jsonl")),
         }
     }
 }
@@ -147,10 +197,16 @@ impl From<std::io::Error> for WebError {
 }
 
 pub async fn serve(config: WebConfig) -> Result<(), WebError> {
+    let telemetry = if let Some(path) = config.telemetry_path.clone() {
+        Telemetry::persistent(path)
+    } else {
+        Telemetry::ephemeral()
+    };
     let state = Arc::new(AppState {
         default_search: SearchConfig::default(),
         theme: config.theme,
         base_url: config.base_url.clone(),
+        telemetry,
     });
     let router = build_router(state, config.enable_openapi);
     info!(
@@ -208,6 +264,12 @@ fn build_router(state: SharedState, _openapi: bool) -> Router {
         .route("/api/lexeme", get(api_lexeme))
         .route("/api/search", get(api_search))
         .route("/api/typeahead", get(api_typeahead))
+        .route("/api/feedback/rate", post(api_rate_section))
+        .route("/api/feedback/report", post(api_report_issue))
+        .route("/api/telemetry/relation-click", post(api_relation_click))
+        .route("/api/analytics/trending", get(api_trending))
+        .route("/api/fun/seven-senses", get(api_challenge))
+        .route("/api/fun/relation-puzzle", get(api_relation_puzzle))
         .route("/healthz", get(health))
         .route("/sitemap.xml", get(sitemap_index))
         .route("/sitemap-:bucket", get(sitemap_bucket))
@@ -240,8 +302,17 @@ async fn shutdown_signal() {
     }
 }
 
-async fn home(State(state): State<SharedState>) -> impl IntoResponse {
-    Html(render_home(state.theme, &state.base_url))
+async fn home(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    let session = SessionHandle::from_headers(&headers);
+    let highlights = HomeHighlights {
+        spotlight: state.telemetry.lexeme_of_the_day(),
+        trending: state.telemetry.trending(6),
+        challenge: state.telemetry.challenge_card(),
+        puzzle: state.telemetry.relation_puzzle(),
+    };
+    let progress = state.telemetry.session_progress(session.id());
+    let html = render_home(state.theme, &state.base_url, &highlights, progress.as_ref());
+    session.into_response(Html(html))
 }
 
 async fn random_redirect() -> impl IntoResponse {
@@ -249,7 +320,12 @@ async fn random_redirect() -> impl IntoResponse {
     Redirect::temporary(&target)
 }
 
-fn render_home(theme: WebTheme, base_url: &str) -> String {
+fn render_home(
+    theme: WebTheme,
+    base_url: &str,
+    highlights: &HomeHighlights,
+    progress: Option<&SessionProgress>,
+) -> String {
     let chrome = Chrome::new(theme);
     let (css_tag, js_tag) = match theme {
         WebTheme::Tailwind => (
@@ -262,8 +338,27 @@ fn render_home(theme: WebTheme, base_url: &str) -> String {
         ),
     };
     let title = "OpenGloss • Friendly Word Explorer";
-    let intro = "Find clear definitions, encyclopedia notes, and related words for more than 150,000 modern English entries.";
+    let intro = "Find kind, plain-language explanations and encyclopedia notes for more than 150,000 modern English entries.";
     let typeahead_script = TYPEAHEAD_WIDGET;
+    let streak_note = progress
+        .map(|p| {
+            format!(
+                r#"<p class="text-sm text-slate-600 mb-0">You’ve explored <strong>{today}</strong> new word{plural} today — {streak}-day streak.</p>"#,
+                today = p.today_unique_words,
+                plural = if p.today_unique_words == 1 { "" } else { "s" },
+                streak = p.consecutive_days,
+            )
+        })
+        .unwrap_or_default();
+    let highlight_section = render_highlights_card(highlights);
+    let challenge_section = render_challenge_section(highlights.challenge.as_ref());
+    let trending_section = render_trending_card(&highlights.trending);
+    let streak_badge = if streak_note.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<div class="rounded bg-slate-50 px-3 py-2">{streak_note}</div>"#)
+    };
+    let search_section = render_search_card(&chrome, intro, &streak_badge);
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -280,35 +375,14 @@ fn render_home(theme: WebTheme, base_url: &str) -> String {
   <body class="{body_class}">
     <main class="{main_class}">
       <div class="{card_class} space-y-6">
-        <section class="space-y-3">
-          <p class="{eyebrow_class}">OpenGloss v{version}</p>
-          <h1 class="{headline_class}">Your dictionary, encyclopedia, and thesaurus in one stop.</h1>
-          <p class="{lede_class}">{intro}</p>
-        </section>
-        <form action="/search" method="get" class="w-full bg-white shadow rounded p-4 flex flex-col gap-3" data-role="typeahead-form">
-          <label class="text-sm font-semibold text-slate-600" for="home-search-input">Look up a word or phrase</label>
-          <div class="d-flex flex-column flex-md-row gap-3">
-            <div class="flex-1 position-relative relative">
-              <input id="home-search-input" name="q" data-role="typeahead-input" placeholder="Try “solar eclipse”, “geometric solid”, “gratitude”…" class="w-full form-control px-4 py-2 rounded border border-slate-300 focus:border-slate-500 focus:ring-2 focus:ring-slate-300" autocomplete="off" />
-              <div class="typeahead-panel" data-role="typeahead-panel" role="listbox" hidden></div>
-            </div>
-            <select name="mode" class="form-select w-full md:w-auto px-3 py-2 rounded border border-slate-300">
-              <option value="substring" selected>Contains text</option>
-              <option value="fuzzy">Best match</option>
-            </select>
-            <button type="submit" class="{button_class} w-full md:w-auto">Search</button>
-          </div>
-          <p id="home-search-status" data-role="typeahead-status" class="text-xs text-slate-500 mb-0"></p>
-        </form>
-        <div class="{cta_group}">
-          <a href="/lexeme?word=farm" class="{button_class}">See an example entry</a>
-          <a href="/index" class="{button_class}">Browse the word index</a>
-          <a href="/random" class="{button_class}">Random word</a>
-        </div>
+        {search_section}
+        {highlight_section}
+        {challenge_section}
+        {trending_section}
       </div>
       <footer class="mt-12 text-center text-sm text-slate-500 space-y-2">
-        <p>Want the geeky bits? Run the bundled CLI or call the JSON API for batch lookups.</p>
-        <p class="text-xs">Suggestions come from an offline trie baked into the Rust binary. Power users can hit <code>/api/typeahead</code> or <code>/api/search</code> directly.</p>
+        <p>Need the nerdy knobs? Run the bundled CLI or call the JSON API for batch lookups—see the README for commands and endpoints.</p>
+        <p class="text-xs">Type-ahead suggestions come directly from the offline trie baked into the Rust binary. Advanced clients can hit <code>/api/typeahead</code>, <code>/api/search</code>, or <code>/api/lexeme</code> for richer automation.</p>
         <p>
           Learn why we built OpenGloss in
           <a href="https://www.arxiv.org/abs/2511.18622" class="text-slate-700 underline hover:text-slate-900" target="_blank" rel="noopener noreferrer">
@@ -325,14 +399,193 @@ fn render_home(theme: WebTheme, base_url: &str) -> String {
         body_class = chrome.body_class,
         main_class = chrome.main_class,
         card_class = chrome.card_class,
+        site_json_ld = indent_json(&website_json_ld(base_url), 4),
+        search_section = search_section,
+        highlight_section = highlight_section,
+        challenge_section = challenge_section,
+        trending_section = trending_section,
+    )
+}
+
+fn render_search_card(chrome: &Chrome, intro: &str, streak_badge: &str) -> String {
+    format!(
+        r#"<section class="bg-white shadow rounded p-6 space-y-4">
+          <div class="space-y-2">
+            <p class="{eyebrow_class}">OpenGloss v{version}</p>
+            <h1 class="{headline_class}">Your friendly dictionary, encyclopedia, and thesaurus.</h1>
+            <p class="{lede_class}">{intro}</p>
+          </div>
+          <form action="/search" method="get" class="w-full flex flex-col gap-3" data-role="typeahead-form">
+            <label class="text-sm font-semibold text-slate-600" for="home-search-input">Search the lexicon</label>
+            <div class="flex flex-col md:flex-row gap-3">
+              <div class="flex-1 position-relative relative">
+                <input id="home-search-input" name="q" data-role="typeahead-input" placeholder="Try “solar eclipse”, “gratitude”, “geometric solid”…" class="w-full form-control px-4 py-2 rounded border border-slate-300 focus:border-slate-500 focus:ring-2 focus:ring-slate-300" autocomplete="off" />
+                <div class="typeahead-panel" data-role="typeahead-panel" role="listbox" hidden></div>
+              </div>
+              <select name="mode" class="form-select w-full md:w-auto px-3 py-2 rounded border border-slate-300">
+                <option value="substring" selected>Contains text</option>
+                <option value="fuzzy">Best match</option>
+              </select>
+              <button type="submit" class="{button_class} w-full md:w-auto">Search</button>
+            </div>
+            <p id="home-search-status" data-role="typeahead-status" class="text-xs text-slate-500 mb-0"></p>
+            {streak_badge}
+          </form>
+          <div class="flex flex-wrap gap-3">
+            <a href="/lexeme?word=farm" class="{button_class}">Explore an example</a>
+            <a href="/index" class="{button_class}">Browse the index</a>
+            <a href="/random" class="{button_class}">Surprise me</a>
+          </div>
+        </section>"#,
         eyebrow_class = chrome.eyebrow_class,
         headline_class = chrome.headline_class,
         lede_class = chrome.lede_class,
-        cta_group = chrome.cta_group_class,
-        button_class = chrome.button_class,
         version = env!("CARGO_PKG_VERSION"),
         intro = intro,
-        site_json_ld = indent_json(&website_json_ld(base_url), 4),
+        button_class = chrome.button_class,
+        streak_badge = streak_badge,
+    )
+}
+
+fn render_highlights_card(highlights: &HomeHighlights) -> String {
+    let mut cards = Vec::new();
+    if let Some(spotlight) = highlights.spotlight.as_ref() {
+        cards.push(render_spotlight_card(spotlight));
+    }
+    if let Some(puzzle) = highlights.puzzle.as_ref() {
+        cards.push(render_puzzle_card(puzzle));
+    }
+    if cards.is_empty() {
+        return String::new();
+    }
+    format!(
+        r#"<section class="bg-white shadow rounded p-6 space-y-4">
+      <div class="flex items-center justify-between">
+        <div>
+          <p class="text-xs uppercase tracking-wide text-slate-500 mb-1">Today’s highlights</p>
+          <h2 class="text-2xl font-semibold">Fresh entries to explore</h2>
+        </div>
+      </div>
+      <div class="grid gap-4 md:grid-cols-2">{cards}</div>
+    </section>"#,
+        cards = cards.join("")
+    )
+}
+
+fn render_challenge_section(challenge: Option<&ChallengeCard>) -> String {
+    let Some(card) = challenge else {
+        return String::new();
+    };
+    let hints = if card.hint_relations.is_empty() {
+        String::from("<span class=\"text-xs text-slate-500\">Mixed relations</span>")
+    } else {
+        card
+            .hint_relations
+            .iter()
+            .map(|rel| format!("<span class=\"inline-flex px-2 py-1 rounded-full bg-slate-100 text-xs text-slate-600\">{}</span>", rel.label()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let steps = card
+        .path
+        .iter()
+        .map(|step| {
+            let via = step
+                .via
+                .map(|rel| format!("<span class=\"text-xs text-slate-500 me-2\">{}</span>", rel.label()))
+                .unwrap_or_default();
+            format!(
+                "<li>{via}<a href=\"{href}\" class=\"text-slate-900 hover:underline\">{label}</a></li>",
+                href = lexeme_path(&step.word),
+                label = xml_escape(&step.word),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<section class="bg-white shadow rounded p-6 space-y-3">
+      <div class="flex flex-col gap-1">
+        <p class="text-xs uppercase tracking-wide text-slate-500 mb-0">Seven Senses Challenge</p>
+        <h2 class="text-2xl font-semibold">{start} → {target}</h2>
+        <p class="text-sm text-slate-600 mb-0">Can you connect these lexemes in {hops} hop{plural}? Follow the relation hints, then reveal the answer.</p>
+      </div>
+      <div class="flex flex-wrap gap-2">{hints}</div>
+      <details class="bg-slate-50 rounded p-4 text-sm">
+        <summary class="cursor-pointer font-semibold">Reveal the path</summary>
+        <ol class="list-decimal ps-5 space-y-1 mt-2">{steps}</ol>
+      </details>
+    </section>"#,
+        start = xml_escape(&card.start.word),
+        target = xml_escape(&card.target.word),
+        hops = card.hop_count,
+        plural = if card.hop_count == 1 { "" } else { "s" },
+        hints = hints,
+        steps = steps,
+    )
+}
+
+fn render_trending_card(trending: &[TrendingLexeme]) -> String {
+    let content = if trending.is_empty() {
+        "<p class=\"text-sm text-slate-500 mb-0\">Peek at a few entries to seed the trending list.</p>"
+            .to_string()
+    } else {
+        let items = trending
+            .iter()
+            .take(8)
+            .map(|row| {
+                format!(
+                    "<li class=\"flex justify-between items-center\"><a href=\"{href}\" class=\"text-blue-700 hover:underline\">{word}</a><span class=\"text-xs text-slate-500\">{views} visits</span></li>",
+                    href = lexeme_path(&row.word),
+                    word = xml_escape(&row.word),
+                    views = row.total_views,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        format!("<ol class=\"space-y-1 ps-4\">{items}</ol>")
+    };
+    format!(
+        r#"<section class="bg-white shadow rounded p-6 space-y-3">
+      <div>
+        <p class="text-xs uppercase tracking-wide text-slate-500 mb-1">Community pulse</p>
+        <h2 class="text-2xl font-semibold">Popular words right now</h2>
+      </div>
+      {content}
+    </section>"#,
+        content = content
+    )
+}
+
+fn render_spotlight_card(spot: &SpotlightLexeme) -> String {
+    format!(
+        r#"<article class="space-y-2">
+      <p class="text-xs uppercase tracking-wide text-slate-500">Lexeme of the day</p>
+      <h3 class="text-xl font-semibold"><a href="{href}" class="text-slate-900 hover:underline">{word}</a></h3>
+      <p class="text-sm text-slate-600">{summary}</p>
+    </article>"#,
+        href = lexeme_path(&spot.word),
+        word = xml_escape(&spot.word),
+        summary = xml_escape(&spot.summary),
+    )
+}
+
+fn render_puzzle_card(puzzle: &RelationPuzzle) -> String {
+    format!(
+        r#"<article class="space-y-2">
+      <p class="text-xs uppercase tracking-wide text-slate-500">Relation puzzle</p>
+      <h3 class="text-xl font-semibold">{word}</h3>
+      <p class="text-sm text-slate-600">Find the missing {relation} that {clue}.</p>
+      <details class="bg-slate-50 rounded p-3 text-sm">
+        <summary class="cursor-pointer font-semibold">Reveal the answer</summary>
+        <p class="mt-2">{answer}</p>
+        <a href="{href}" class="inline-flex items-center text-blue-700 hover:underline text-sm">Jump to entry</a>
+      </details>
+    </article>"#,
+        word = xml_escape(&puzzle.word),
+        relation = puzzle.relation.label(),
+        clue = xml_escape(&puzzle.clue),
+        answer = xml_escape(&puzzle.answer),
+        href = lexeme_path(&puzzle.word),
     )
 }
 
@@ -510,29 +763,168 @@ const TYPEAHEAD_WIDGET: &str = r#"
 </script>
 "#;
 
+const FEEDBACK_WIDGET: &str = r#"
+<script>
+  (function() {
+    const sections = document.querySelectorAll('[data-feedback-target]');
+    sections.forEach((section) => {
+      const buttons = section.querySelectorAll('[data-feedback-vote]');
+      const status = section.querySelector('[data-feedback-status]');
+      buttons.forEach((button) => {
+        button.addEventListener('click', async () => {
+          const direction = button.dataset.feedbackVote || 'up';
+          const payload = buildPayload(section, direction);
+          if (!payload) {
+            setStatus(status, 'Unable to send feedback right now.');
+            return;
+          }
+          setStatus(status, 'Sending…');
+          try {
+            const response = await fetch('/api/feedback/rate', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            });
+            if (response.ok) {
+              setStatus(status, 'Thanks for helping improve this entry!');
+            } else {
+              setStatus(status, 'Unable to save feedback right now.');
+            }
+          } catch (error) {
+            setStatus(status, 'Unable to save feedback right now.');
+          }
+        });
+      });
+    });
+
+    document.querySelectorAll('[data-relation-click]').forEach((link) => {
+      link.addEventListener(
+        'click',
+        () => {
+          const payload = {
+            lexeme_id: Number(link.dataset.source),
+            target_word: link.dataset.targetWord || '',
+          };
+          if (!payload.lexeme_id || !payload.target_word.trim()) {
+            return;
+          }
+          const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+          if (navigator.sendBeacon) {
+            navigator.sendBeacon('/api/telemetry/relation-click', blob);
+          } else {
+            fetch('/api/telemetry/relation-click', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+              keepalive: true,
+            });
+          }
+        },
+        { passive: true }
+      );
+    });
+
+    const issueForm = document.querySelector('[data-issue-form]');
+    if (issueForm) {
+      const status = issueForm.querySelector('[data-issue-status]');
+      issueForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const formData = new FormData(issueForm);
+        const noteRaw = (formData.get('note') || '').toString().trim();
+        const payload = {
+          lexeme_id: Number(formData.get('lexeme_id')),
+          reason: (formData.get('reason') || '').toString(),
+        };
+        if (noteRaw.length) {
+          payload.note = noteRaw;
+        }
+        if (!payload.lexeme_id) {
+          setStatus(status, 'Please reload and try again.');
+          return;
+        }
+        setStatus(status, 'Sending…');
+        try {
+          const response = await fetch('/api/feedback/report', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          if (response.ok) {
+            issueForm.reset();
+            setStatus(status, 'Thanks! Your note is in the review queue.');
+          } else {
+            setStatus(status, 'Unable to send report right now.');
+          }
+        } catch (error) {
+          setStatus(status, 'Unable to send report right now.');
+        }
+      });
+    }
+
+    function buildPayload(section, vote) {
+      const lexemeId = Number(section.dataset.lexemeId);
+      if (!lexemeId) return null;
+      const kind = section.dataset.feedbackKind;
+      const senseIndex = Number(section.dataset.senseIndex);
+      const relationKind = section.dataset.relationKind;
+      let target = null;
+      if (kind === 'sense-definition' && Number.isFinite(senseIndex)) {
+        target = { type: 'sense_definition', sense_index: senseIndex };
+      } else if (kind === 'sense-relations' && Number.isFinite(senseIndex) && relationKind) {
+        target = { type: 'sense_relations', sense_index: senseIndex, relation: relationKind };
+      } else if (kind === 'encyclopedia') {
+        target = { type: 'encyclopedia' };
+      }
+      if (!target) return null;
+      return {
+        lexeme_id: lexemeId,
+        vote: vote === 'down' ? 'down' : 'up',
+        target,
+      };
+    }
+
+    function setStatus(node, text) {
+      if (node) {
+        node.textContent = text || '';
+      }
+    }
+  })();
+</script>
+"#;
+
 async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok", "service": "opengloss-web" }))
 }
 
 async fn lexeme_html(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Query(params): Query<LexemeParams>,
 ) -> impl IntoResponse {
-    lexeme_html_inner(state, params).await
+    let session = SessionHandle::from_headers(&headers);
+    let html = lexeme_html_inner(state, session.id(), params).await;
+    session.into_response(html)
 }
 
 async fn lexeme_html_by_id(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Path(id): Path<u32>,
 ) -> impl IntoResponse {
     let params = LexemeParams {
         word: None,
         id: Some(id),
     };
-    lexeme_html_inner(state, params).await
+    let session = SessionHandle::from_headers(&headers);
+    let html = lexeme_html_inner(state, session.id(), params).await;
+    session.into_response(html)
 }
 
-async fn lexeme_html_inner(state: SharedState, params: LexemeParams) -> Html<String> {
+async fn lexeme_html_inner(
+    state: SharedState,
+    session_id: &str,
+    params: LexemeParams,
+) -> Html<String> {
     match entry_from_params(&params) {
         Ok(entry) => {
             let chrome = Chrome::new(state.theme);
@@ -548,31 +940,51 @@ async fn lexeme_html_inner(state: SharedState, params: LexemeParams) -> Html<Str
                     css_class: pos_chip_class(label),
                 })
                 .collect();
+            let sense_count = payload.senses.len();
+            let feedback = state.telemetry.lexeme_feedback_bundle(entry.lexeme_id());
+            let relation_heatmap = state
+                .telemetry
+                .relation_heatmap(entry.lexeme_id(), 6)
+                .into_iter()
+                .map(|row| RelationHeatmapRow {
+                    label: row.target_word.clone(),
+                    href: LexemeIndex::entry_by_word(&row.target_word)
+                        .map(|_| lexeme_path(&row.target_word)),
+                    count: row.count,
+                })
+                .collect();
+            let session_progress = state
+                .telemetry
+                .record_lexeme_view(entry.lexeme_id(), session_id);
+            let encyclopedia_confidence = feedback
+                .encyclopedia
+                .as_ref()
+                .and_then(|summary| describe_ratio(summary, "for this encyclopedia entry"));
             let senses = payload
                 .senses
                 .iter()
-                .map(|sense| SenseBlock {
-                    payload: sense,
-                    definition_html: render_markdown(sense.definition.as_deref()),
-                    synonyms: relation_links(&sense.synonyms),
-                    antonyms: relation_links(&sense.antonyms),
-                    hypernyms: relation_links(&sense.hypernyms),
-                    hyponyms: relation_links(&sense.hyponyms),
-                })
+                .map(|sense| build_sense_block(sense, &feedback))
                 .collect();
-            let sense_count = payload.senses.len();
-    let template = LexemeTemplate {
-        chrome,
-        payload: &payload,
-        canonical_url: absolute_lexeme_url(&state.base_url, entry.word()),
-        json_ld,
-        encyclopedia_html,
-        pos_chips,
-        senses,
-        sense_count,
-        typeahead_header: typeahead_header_html(),
-    };
-            Html(template.render().unwrap_or_else(|err| render_error_page(state.theme, err.to_string())))
+            let template = LexemeTemplate {
+                chrome,
+                payload: &payload,
+                canonical_url: absolute_lexeme_url(&state.base_url, entry.word()),
+                json_ld,
+                encyclopedia_html,
+                pos_chips,
+                senses,
+                sense_count,
+                typeahead_header: typeahead_header_html(),
+                session_progress: Some(session_progress),
+                encyclopedia_confidence,
+                relation_heatmap,
+                feedback_script: FEEDBACK_WIDGET,
+            };
+            Html(
+                template
+                    .render()
+                    .unwrap_or_else(|err| render_error_page(state.theme, err.to_string())),
+            )
         }
         Err(err) => Html(render_error_page(state.theme, err.message)),
     }
@@ -580,8 +992,10 @@ async fn lexeme_html_inner(state: SharedState, params: LexemeParams) -> Html<Str
 
 async fn search_html(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Query(params): Query<SearchParams>,
 ) -> impl IntoResponse {
+    let session = SessionHandle::from_headers(&headers);
     match parse_search_params(&params) {
         Ok((query, limit, mode)) => {
             let payload = match mode {
@@ -595,26 +1009,30 @@ async fn search_html(
                 search_page_json_ld(&payload, &state.base_url),
                 HtmlEscaper,
             );
-    let template = SearchTemplate {
-        chrome,
-        payload: &payload,
-        json_ld,
-        typeahead_header: typeahead_header_html(),
-    };
-            Html(
-                template
-                    .render()
-                    .unwrap_or_else(|err| render_error_page(state.theme, err.to_string())),
-            )
+            let template = SearchTemplate {
+                chrome,
+                payload: &payload,
+                json_ld,
+                typeahead_header: typeahead_header_html(),
+            };
+            let html = template
+                .render()
+                .unwrap_or_else(|err| render_error_page(state.theme, err.to_string()));
+            session.into_response(Html(html))
         }
-        Err(err) => Html(render_error_page(state.theme, err.message)),
+        Err(err) => {
+            let html = render_error_page(state.theme, err.message);
+            session.into_response(Html(html))
+        }
     }
 }
 
 async fn prefix_index_html(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Query(params): Query<IndexParams>,
 ) -> impl IntoResponse {
+    let session = SessionHandle::from_headers(&headers);
     let letters = params.letters.unwrap_or(1).clamp(1, MAX_PREFIX_LEVEL);
     let display_prefix = params
         .prefix
@@ -635,11 +1053,10 @@ async fn prefix_index_html(
         base_url: &state.base_url,
         typeahead_header: typeahead_header_html(),
     };
-    Html(
-        template
-            .render()
-            .unwrap_or_else(|err| render_error_page(state.theme, err.to_string())),
-    )
+    let html = template
+        .render()
+        .unwrap_or_else(|err| render_error_page(state.theme, err.to_string()));
+    session.into_response(Html(html))
 }
 
 async fn api_lexeme(Query(params): Query<LexemeParams>) -> Result<Json<LexemePayload>, ApiError> {
@@ -699,6 +1116,78 @@ async fn api_typeahead(
         mode,
         suggestions,
     }))
+}
+
+async fn api_rate_section(
+    State(state): State<SharedState>,
+    Json(payload): Json<RateSectionPayload>,
+) -> Result<Json<RateSectionResponse>, ApiError> {
+    let section = payload.target.into_section_kind();
+    let summary = state
+        .telemetry
+        .record_section_vote(SectionKey::new(payload.lexeme_id, section), payload.vote);
+    Ok(Json(RateSectionResponse {
+        up: summary.up,
+        down: summary.down,
+        total: summary.total(),
+        confidence: summary.confidence_ratio(),
+    }))
+}
+
+async fn api_report_issue(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(payload): Json<IssueReportPayload>,
+) -> Result<Response, ApiError> {
+    let session = SessionHandle::from_headers(&headers);
+    let lexeme_id = payload
+        .lexeme_id
+        .ok_or_else(|| ApiError::bad_request("lexeme_id is required"))?;
+    let report = state.telemetry.record_issue(IssueReportRequest {
+        lexeme_id: Some(lexeme_id),
+        section: payload.target.map(|target| target.into_section_kind()),
+        reason: payload.reason,
+        note: payload.note,
+        session_id: Some(session.id().to_string()),
+    });
+    let body = Json(IssueReportResponse {
+        id: report.id,
+        queued: true,
+    });
+    Ok(session.into_response(body))
+}
+
+async fn api_relation_click(
+    State(state): State<SharedState>,
+    Json(payload): Json<RelationClickPayload>,
+) -> impl IntoResponse {
+    let target = payload.target_word.trim();
+    if !target.is_empty() {
+        state
+            .telemetry
+            .record_relation_click(payload.lexeme_id, target);
+    }
+    StatusCode::NO_CONTENT
+}
+
+async fn api_trending(State(state): State<SharedState>) -> impl IntoResponse {
+    let entries = state.telemetry.trending(12);
+    Json(TrendingResponse {
+        generated_at: unix_seconds(),
+        entries,
+    })
+}
+
+async fn api_challenge(State(state): State<SharedState>) -> impl IntoResponse {
+    Json(ChallengeResponse {
+        challenge: state.telemetry.challenge_card(),
+    })
+}
+
+async fn api_relation_puzzle(State(state): State<SharedState>) -> impl IntoResponse {
+    Json(PuzzleResponse {
+        puzzle: state.telemetry.relation_puzzle(),
+    })
 }
 
 async fn sitemap_index(State(state): State<SharedState>) -> impl IntoResponse {
@@ -868,16 +1357,28 @@ struct IndexPagePayload<'a> {
 struct SenseBlock<'a> {
     payload: &'a SensePayload,
     definition_html: Option<String>,
-    synonyms: Vec<RelationLink>,
-    antonyms: Vec<RelationLink>,
-    hypernyms: Vec<RelationLink>,
-    hyponyms: Vec<RelationLink>,
+    definition_confidence: Option<String>,
+    relation_groups: Vec<RelationGroup>,
+}
+
+struct RelationGroup {
+    title: &'static str,
+    title_lower: String,
+    kind: RelationKind,
+    links: Vec<RelationLink>,
+    confidence: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct RelationLink {
     label: String,
     href: Option<String>,
+}
+
+struct RelationHeatmapRow {
+    label: String,
+    href: Option<String>,
+    count: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -891,6 +1392,108 @@ struct TypeaheadResponse {
 struct TypeaheadSuggestion {
     word: String,
     lexeme_id: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateSectionPayload {
+    lexeme_id: u32,
+    target: FeedbackTargetPayload,
+    vote: VoteDirection,
+}
+
+#[derive(Debug, Serialize)]
+struct RateSectionResponse {
+    up: u64,
+    down: u64,
+    total: u64,
+    confidence: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueReportPayload {
+    lexeme_id: Option<u32>,
+    target: Option<FeedbackTargetPayload>,
+    reason: IssueKind,
+    note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct IssueReportResponse {
+    id: u64,
+    queued: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RelationClickPayload {
+    lexeme_id: u32,
+    target_word: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum FeedbackTargetPayload {
+    SenseDefinition {
+        sense_index: i32,
+    },
+    SenseRelations {
+        sense_index: i32,
+        relation: RelationKindParam,
+    },
+    Encyclopedia,
+}
+
+#[derive(Debug, Deserialize, Copy, Clone)]
+#[serde(rename_all = "lowercase")]
+enum RelationKindParam {
+    Synonym,
+    Antonym,
+    Hypernym,
+    Hyponym,
+}
+
+impl From<RelationKindParam> for RelationKind {
+    fn from(value: RelationKindParam) -> Self {
+        match value {
+            RelationKindParam::Synonym => RelationKind::Synonym,
+            RelationKindParam::Antonym => RelationKind::Antonym,
+            RelationKindParam::Hypernym => RelationKind::Hypernym,
+            RelationKindParam::Hyponym => RelationKind::Hyponym,
+        }
+    }
+}
+
+impl FeedbackTargetPayload {
+    fn into_section_kind(self) -> SectionKind {
+        match self {
+            FeedbackTargetPayload::SenseDefinition { sense_index } => {
+                SectionKind::SenseDefinition { sense_index }
+            }
+            FeedbackTargetPayload::SenseRelations {
+                sense_index,
+                relation,
+            } => SectionKind::SenseRelations {
+                sense_index,
+                relation: relation.into(),
+            },
+            FeedbackTargetPayload::Encyclopedia => SectionKind::Encyclopedia,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TrendingResponse {
+    generated_at: u64,
+    entries: Vec<TrendingLexeme>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChallengeResponse {
+    challenge: Option<ChallengeCard>,
+}
+
+#[derive(Debug, Serialize)]
+struct PuzzleResponse {
+    puzzle: Option<RelationPuzzle>,
 }
 
 #[derive(Debug, Clone)]
@@ -1197,6 +1800,39 @@ fn encode_component(value: &str) -> String {
     utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
 }
 
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    for value in headers.get_all(header::COOKIE).iter() {
+        if let Ok(text) = value.to_str() {
+            for pair in text.split(';') {
+                let mut parts = pair.trim().splitn(2, '=');
+                let key = parts.next()?.trim();
+                if key == name {
+                    if let Some(val) = parts.next() {
+                        return Some(val.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn build_session_cookie_header(id: &str) -> Option<HeaderValue> {
+    let cookie = Cookie::build((SESSION_COOKIE, id.to_string()))
+        .path("/")
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .build();
+    HeaderValue::from_str(&cookie.to_string()).ok()
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn lexeme_path(word: &str) -> String {
     format!("/lexeme?word={}", encode_component(word))
 }
@@ -1274,7 +1910,6 @@ fn typeahead_header_html() -> String {
         widget = TYPEAHEAD_WIDGET
     )
 }
-
 
 fn defined_term_set_json_ld(base_url: &str) -> String {
     let index_url = format!("{base}/index", base = base_url);
@@ -1447,14 +2082,99 @@ fn relation_links(terms: &[String]) -> Vec<RelationLink> {
     terms
         .iter()
         .map(|term| {
-            let href = LexemeIndex::entry_by_word(term)
-                .map(|_| lexeme_path(term));
+            let href = LexemeIndex::entry_by_word(term).map(|_| lexeme_path(term));
             RelationLink {
                 label: term.clone(),
                 href,
             }
         })
         .collect()
+}
+
+fn build_sense_block<'a>(
+    sense: &'a SensePayload,
+    feedback: &LexemeFeedbackBundle,
+) -> SenseBlock<'a> {
+    let definition_html = render_markdown(sense.definition.as_deref());
+    let definition_confidence = feedback
+        .definitions
+        .get(&sense.sense_index)
+        .and_then(|summary| describe_ratio(summary, "for this definition"));
+    let mut relation_groups = Vec::new();
+    if let Some(group) = relation_group(
+        "Synonyms",
+        RelationKind::Synonym,
+        &sense.synonyms,
+        sense.sense_index,
+        feedback,
+    ) {
+        relation_groups.push(group);
+    }
+    if let Some(group) = relation_group(
+        "Antonyms",
+        RelationKind::Antonym,
+        &sense.antonyms,
+        sense.sense_index,
+        feedback,
+    ) {
+        relation_groups.push(group);
+    }
+    if let Some(group) = relation_group(
+        "Hypernyms",
+        RelationKind::Hypernym,
+        &sense.hypernyms,
+        sense.sense_index,
+        feedback,
+    ) {
+        relation_groups.push(group);
+    }
+    if let Some(group) = relation_group(
+        "Hyponyms",
+        RelationKind::Hyponym,
+        &sense.hyponyms,
+        sense.sense_index,
+        feedback,
+    ) {
+        relation_groups.push(group);
+    }
+
+    SenseBlock {
+        payload: sense,
+        definition_html,
+        definition_confidence,
+        relation_groups,
+    }
+}
+
+fn relation_group(
+    title: &'static str,
+    kind: RelationKind,
+    terms: &[String],
+    sense_index: i32,
+    feedback: &LexemeFeedbackBundle,
+) -> Option<RelationGroup> {
+    if terms.is_empty() {
+        return None;
+    }
+    let confidence = feedback
+        .relations
+        .get(&(sense_index, kind))
+        .and_then(|summary| {
+            let subject = match kind {
+                RelationKind::Synonym => "for these synonyms",
+                RelationKind::Antonym => "for these antonyms",
+                RelationKind::Hypernym => "for these hypernyms",
+                RelationKind::Hyponym => "for these hyponyms",
+            };
+            describe_ratio(summary, subject)
+        });
+    Some(RelationGroup {
+        title,
+        title_lower: title.to_lowercase(),
+        kind,
+        links: relation_links(terms),
+        confidence,
+    })
 }
 
 fn pos_chip_class(label: &str) -> &'static str {
@@ -1679,6 +2399,85 @@ fn pos_chip_class(label: &str) -> &'static str {
         padding: 0.15rem 0.5rem;
         border-radius: 999px;
       }
+      .feedback-row {
+        margin-top: 0.5rem;
+        padding-top: 0.5rem;
+        border-top: 1px dashed rgba(15, 23, 42, 0.15);
+        display: flex;
+        flex-direction: column;
+        gap: 0.35rem;
+      }
+      .feedback-buttons {
+        display: inline-flex;
+        gap: 0.4rem;
+        flex-wrap: wrap;
+      }
+      .feedback-button {
+        width: 2rem;
+        height: 2rem;
+        border-radius: 999px;
+        border: 1px solid rgba(15, 23, 42, 0.25);
+        background: rgba(15, 23, 42, 0.02);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 0.95rem;
+        cursor: pointer;
+        transition: border-color 120ms ease, background-color 120ms ease;
+      }
+      .feedback-button:hover {
+        border-color: rgba(15, 23, 42, 0.45);
+        background-color: rgba(15, 23, 42, 0.06);
+      }
+      .confidence-pill {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.2rem 0.8rem;
+        border-radius: 999px;
+        background-color: rgba(34, 197, 94, 0.12);
+        color: #15803d;
+        font-size: 0.75rem;
+        font-weight: 600;
+        width: fit-content;
+      }
+      .heatmap-list {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 0.4rem;
+      }
+      .heatmap-list li {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0.4rem 0.2rem;
+        border-bottom: 1px dashed rgba(15, 23, 42, 0.08);
+      }
+      .issue-form {
+        display: flex;
+        flex-direction: column;
+        gap: 0.6rem;
+      }
+      .issue-form textarea,
+      .issue-form select {
+        width: 100%;
+        border: 1px solid rgba(15, 23, 42, 0.15);
+        border-radius: 0.5rem;
+        padding: 0.5rem 0.75rem;
+        font-size: 0.9rem;
+      }
+      .issue-form button {
+        align-self: flex-start;
+        border-radius: 999px;
+        background-color: #0f172a;
+        color: white;
+        font-weight: 600;
+        padding: 0.45rem 1.2rem;
+        border: none;
+        cursor: pointer;
+      }
     </style>
     <script type="application/ld+json">
     {{ json_ld }}
@@ -1708,7 +2507,7 @@ fn pos_chip_class(label: &str) -> &'static str {
         </nav>
 
         <section id="overview">
-          <div class="grid gap-3 md:grid-cols-3 row row-cols-1 row-cols-md-3 g-2 overview-grid">
+          <div class="grid gap-3 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 overview-grid">
             <div class="overview-card">
               <div>
                 <p class="overview-title">Sense coverage</p>
@@ -1735,6 +2534,9 @@ fn pos_chip_class(label: &str) -> &'static str {
                 <p class="overview-title">Encyclopedia</p>
                 {% if encyclopedia_html.is_some() %}
                 <p class="overview-detail">Includes a long-form article.</p>
+                {% if encyclopedia_confidence.is_some() %}
+                <span class="confidence-pill">{{ encyclopedia_confidence.as_ref().unwrap() }}</span>
+                {% endif %}
                 {% else %}
                 <p class="overview-detail">No encyclopedia article available.</p>
                 {% endif %}
@@ -1743,6 +2545,16 @@ fn pos_chip_class(label: &str) -> &'static str {
               <a href='#encyclopedia' class="overview-link">Jump</a>
               {% endif %}
             </div>
+            {% if session_progress.is_some() %}
+            <div class="overview-card">
+              <div>
+                <p class="overview-title">Your streak</p>
+                <p class="overview-detail">{{ session_progress.as_ref().unwrap().consecutive_days }}-day streak</p>
+                <p class="overview-detail text-xs text-slate-500">{{ session_progress.as_ref().unwrap().total_unique_words }} total words explored</p>
+              </div>
+              <p class="overview-value">{{ session_progress.as_ref().unwrap().today_unique_words }}</p>
+            </div>
+            {% endif %}
           </div>
         </section>
 
@@ -1775,62 +2587,44 @@ fn pos_chip_class(label: &str) -> &'static str {
                   <p>Definition unavailable</p>
                 {% endif %}
               </div>
-              {% if sense.synonyms.len() > 0 %}
+              <div class="feedback-row" data-feedback-target data-feedback-kind="sense-definition" data-lexeme-id="{{ payload.lexeme_id }}" data-sense-index="{{ sense.payload.sense_index }}">
+                <p class="text-xs uppercase tracking-wide text-slate-500">Was this definition helpful?</p>
+                <div class="feedback-buttons">
+                  <button type="button" class="feedback-button" data-feedback-vote="up" aria-label="Mark this definition helpful" title="Mark this definition helpful">👍</button>
+                  <button type="button" class="feedback-button" data-feedback-vote="down" aria-label="Flag this definition" title="Flag this definition">👎</button>
+                </div>
+                {% if sense.definition_confidence.is_some() %}
+                <span class="confidence-pill">{{ sense.definition_confidence.as_ref().unwrap() }}</span>
+                {% endif %}
+                <p class="text-xs text-slate-500 feedback-status" data-feedback-status></p>
+              </div>
+              {% for group in sense.relation_groups %}
               <div class="mt-3">
-                <p class="font-semibold mb-1">Synonyms</p>
-                <div class="relation-chip-group">
-                  {% for syn in sense.synonyms %}
-                  {% if syn.href.is_some() %}
-                  <a href="{{ syn.href.as_ref().unwrap() }}" class="relation-chip">{{ syn.label }}</a>
+                <div class="d-flex flex-column flex-md-row justify-content-between align-items-center gap-2">
+                  <p class="font-semibold mb-0">{{ group.title }}</p>
+                  {% if group.confidence.is_some() %}
+                  <span class="confidence-pill">{{ group.confidence.as_ref().unwrap() }}</span>
+                  {% endif %}
+                </div>
+                <div class="relation-chip-group mt-2">
+                  {% for rel in group.links %}
+                  {% if rel.href.is_some() %}
+                  <a href="{{ rel.href.as_ref().unwrap() }}" class="relation-chip" data-relation-click data-source="{{ payload.lexeme_id }}" data-target-word="{{ rel.label }}">{{ rel.label }}</a>
                   {% else %}
-                  <span class="relation-chip relation-chip-disabled">{{ syn.label }}</span>
+                  <span class="relation-chip relation-chip-disabled">{{ rel.label }}</span>
                   {% endif %}
                   {% endfor %}
                 </div>
-              </div>
-              {% endif %}
-              {% if sense.antonyms.len() > 0 %}
-              <div class="mt-3">
-                <p class="font-semibold mb-1">Antonyms</p>
-                <div class="relation-chip-group">
-                  {% for ant in sense.antonyms %}
-                  {% if ant.href.is_some() %}
-                  <a href="{{ ant.href.as_ref().unwrap() }}" class="relation-chip">{{ ant.label }}</a>
-                  {% else %}
-                  <span class="relation-chip relation-chip-disabled">{{ ant.label }}</span>
-                  {% endif %}
-                  {% endfor %}
+                <div class="feedback-row" data-feedback-target data-feedback-kind="sense-relations" data-lexeme-id="{{ payload.lexeme_id }}" data-sense-index="{{ sense.payload.sense_index }}" data-relation-kind="{{ group.kind.label() }}">
+                  <p class="text-xs uppercase tracking-wide text-slate-500">Are these {{ group.title_lower }} useful?</p>
+                  <div class="feedback-buttons">
+                    <button type="button" class="feedback-button" data-feedback-vote="up" aria-label="Mark these relations helpful" title="Mark these relations helpful">👍</button>
+                    <button type="button" class="feedback-button" data-feedback-vote="down" aria-label="Flag these relations" title="Flag these relations">👎</button>
+                  </div>
+                  <p class="text-xs text-slate-500 feedback-status" data-feedback-status></p>
                 </div>
               </div>
-              {% endif %}
-              {% if sense.hypernyms.len() > 0 %}
-              <div class="mt-3">
-                <p class="font-semibold mb-1">Hypernyms</p>
-                <div class="relation-chip-group">
-                  {% for hyper in sense.hypernyms %}
-                  {% if hyper.href.is_some() %}
-                  <a href="{{ hyper.href.as_ref().unwrap() }}" class="relation-chip">{{ hyper.label }}</a>
-                  {% else %}
-                  <span class="relation-chip relation-chip-disabled">{{ hyper.label }}</span>
-                  {% endif %}
-                  {% endfor %}
-                </div>
-              </div>
-              {% endif %}
-              {% if sense.hyponyms.len() > 0 %}
-              <div class="mt-3">
-                <p class="font-semibold mb-1">Hyponyms</p>
-                <div class="relation-chip-group">
-                  {% for hypo in sense.hyponyms %}
-                  {% if hypo.href.is_some() %}
-                  <a href="{{ hypo.href.as_ref().unwrap() }}" class="relation-chip">{{ hypo.label }}</a>
-                  {% else %}
-                  <span class="relation-chip relation-chip-disabled">{{ hypo.label }}</span>
-                  {% endif %}
-                  {% endfor %}
-                </div>
-              </div>
-              {% endif %}
+              {% endfor %}
               {% if sense.payload.examples.len() > 0 %}
               <div class="mt-3">
                 <p class="font-semibold mb-1">Examples</p>
@@ -1846,14 +2640,65 @@ fn pos_chip_class(label: &str) -> &'static str {
           </div>
         </section>
 
+        {% if relation_heatmap.len() > 0 %}
+        <section id="community">
+          <h2 class="text-xl font-semibold mb-2">Community explorer</h2>
+          <p class="text-sm text-slate-600 mb-2">Readers who opened this entry also clicked:</p>
+          <ul class="heatmap-list">
+            {% for row in relation_heatmap %}
+            <li>
+              {% if row.href.is_some() %}
+              <a href="{{ row.href.as_ref().unwrap() }}" class="text-blue-700 hover:underline">{{ row.label }}</a>
+              {% else %}
+              <span>{{ row.label }}</span>
+              {% endif %}
+              <span class="text-xs text-slate-500">{{ row.count }} jumps</span>
+            </li>
+            {% endfor %}
+          </ul>
+        </section>
+        {% endif %}
+
+        <section id="quality">
+          <h2 class="text-xl font-semibold mb-2">Quality &amp; feedback</h2>
+          <p class="text-sm text-slate-600">Rate specific sections or flag anything that feels off. We review every note.</p>
+          <form class="issue-form" data-issue-form>
+            <input type="hidden" name="lexeme_id" value="{{ payload.lexeme_id }}" />
+            <label class="text-sm text-slate-600" for="issue-reason">What should we look at?</label>
+            <select name="reason" id="issue-reason">
+              <option value="duplicate_word">Duplicate word</option>
+              <option value="offensive_content">Offensive content</option>
+              <option value="broken_relation">Broken relation</option>
+              <option value="formatting_issue">Formatting issue</option>
+              <option value="other">Other</option>
+            </select>
+            <label class="text-sm text-slate-600" for="issue-note">Details (optional)</label>
+            <textarea id="issue-note" name="note" rows="3" placeholder="Tell us what you noticed…"></textarea>
+            <button type="submit">Send report</button>
+            <p class="text-xs text-slate-500 feedback-status" data-issue-status></p>
+          </form>
+        </section>
+
         {% if encyclopedia_html.is_some() %}
         <section id="encyclopedia">
           <h2 class="text-xl font-semibold mb-2">Encyclopedia Entry</h2>
           <div class="bg-white shadow rounded p-4 prose prose-slate max-w-none rich-text">{{ encyclopedia_html.as_ref().unwrap()|safe }}</div>
+          <div class="feedback-row" data-feedback-target data-feedback-kind="encyclopedia" data-lexeme-id="{{ payload.lexeme_id }}">
+            <p class="text-xs uppercase tracking-wide text-slate-500">Is this article helpful?</p>
+            <div class="feedback-buttons">
+              <button type="button" class="feedback-button" data-feedback-vote="up" aria-label="Mark this article helpful" title="Mark this article helpful">👍</button>
+              <button type="button" class="feedback-button" data-feedback-vote="down" aria-label="Flag this article" title="Flag this article">👎</button>
+            </div>
+            {% if encyclopedia_confidence.is_some() %}
+            <span class="confidence-pill">{{ encyclopedia_confidence.as_ref().unwrap() }}</span>
+            {% endif %}
+            <p class="text-xs text-slate-500 feedback-status" data-feedback-status></p>
+          </div>
         </section>
         {% endif %}
       </div>
     </main>
+    {{ feedback_script|safe }}
   </body>
 </html>"#,
     ext = "html"
@@ -1868,6 +2713,10 @@ struct LexemeTemplate<'a> {
     senses: Vec<SenseBlock<'a>>,
     sense_count: usize,
     typeahead_header: String,
+    session_progress: Option<SessionProgress>,
+    encyclopedia_confidence: Option<String>,
+    relation_heatmap: Vec<RelationHeatmapRow>,
+    feedback_script: &'static str,
 }
 
 #[derive(Template)]
@@ -2047,7 +2896,11 @@ impl fmt::Display for SearchModeParam {
 #[cfg(all(test, feature = "web"))]
 mod tests {
     use super::*;
-    use axum::{body, body::Body, http::{header, Request}};
+    use axum::{
+        body,
+        body::Body,
+        http::{Request, header},
+    };
     use tower::ServiceExt;
 
     fn test_router() -> Router {
@@ -2055,6 +2908,7 @@ mod tests {
             default_search: SearchConfig::default(),
             theme: WebTheme::Tailwind,
             base_url: "http://127.0.0.1:8080".to_string(),
+            telemetry: Telemetry::ephemeral(),
         });
         build_router(state, false)
     }
@@ -2211,11 +3065,7 @@ mod tests {
     async fn lexeme_markdown_renders_html() {
         let router = test_router();
         let response = router
-            .oneshot(
-                Request::get("/lexeme?word=3d")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/lexeme?word=3d").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert!(response.status().is_success());
@@ -2248,7 +3098,8 @@ mod tests {
 
     #[test]
     fn render_markdown_str_preserves_iframe_when_allowed() {
-        let html = render_markdown_str("<iframe src=\"https://example.com\"></iframe>").expect("rendered");
+        let html =
+            render_markdown_str("<iframe src=\"https://example.com\"></iframe>").expect("rendered");
         assert!(
             html.contains("<iframe src=\"https://example.com\"></iframe>"),
             "GFM tag filter must be disabled so embeddable HTML survives"

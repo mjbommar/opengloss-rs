@@ -16,9 +16,9 @@ use opengloss_rs::{
 use rayon::ThreadPoolBuilder;
 use serde_json::json;
 #[cfg(feature = "web")]
-use std::net::SocketAddr;
-#[cfg(feature = "web")]
 use std::sync::OnceLock;
+#[cfg(feature = "web")]
+use std::{net::SocketAddr, path::PathBuf};
 use termimad::{FmtText, MadSkin, terminal_size};
 #[cfg(feature = "web")]
 use tokio::runtime::Builder as TokioRuntimeBuilder;
@@ -148,6 +148,9 @@ struct ServeArgs {
     /// Front-end theme to load for HTML pages.
     #[arg(long, value_enum, default_value_t = ServeTheme::Tailwind)]
     theme: ServeTheme,
+    /// Optional path to append telemetry snapshots (JSONL). Defaults to data/telemetry/telemetry-log.jsonl.
+    #[arg(long, value_name = "PATH")]
+    telemetry_log: Option<PathBuf>,
 }
 
 #[cfg(feature = "web")]
@@ -432,12 +435,14 @@ fn handle_serve(args: ServeArgs) -> Result<(), Box<dyn Error>> {
         .parse()
         .map_err(|_| user_error(format!("Invalid socket address {:?}", args.addr)))?;
     let base_url = normalize_base_url(&addr, args.public_base.as_deref());
-    let config = WebConfig {
-        addr,
-        enable_openapi: args.openapi,
-        theme: args.theme.into(),
-        base_url,
-    };
+    let mut config = WebConfig::default();
+    config.addr = addr;
+    config.enable_openapi = args.openapi;
+    config.theme = args.theme.into();
+    config.base_url = base_url;
+    if let Some(path) = args.telemetry_log {
+        config.telemetry_path = Some(path);
+    }
     tracing::info!(
         %config.addr,
         openapi = config.enable_openapi,

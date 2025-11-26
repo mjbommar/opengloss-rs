@@ -3,6 +3,9 @@ mod data;
 #[cfg(feature = "web")]
 pub mod web;
 
+#[cfg(feature = "web")]
+pub mod telemetry;
+
 use data::{
     ArchivedCompressedTextStore, ArchivedDataStore, ArchivedEntryRecord, ArchivedPackedStrings,
     ArchivedRange, ArchivedSenseRecord, ArchivedStringId, ArchivedTextId, ArchivedU32,
@@ -16,6 +19,7 @@ use rapidfuzz::fuzz;
 use rayon::prelude::*;
 use rkyv::access_unchecked;
 use rkyv::util::AlignedVec;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::fmt;
@@ -52,7 +56,7 @@ static FUZZY_CACHE: Lazy<Mutex<lru::LruCache<(String, SearchConfig, usize), Vec<
 /// Read-only access to the lexeme trie.
 pub struct LexemeIndex;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RelationKind {
     Synonym,
     Antonym,
