@@ -3,7 +3,7 @@ use askama::Html as HtmlEscaper;
 use askama::{MarkupDisplay, Template};
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
     routing::get,
@@ -25,6 +25,12 @@ use tracing::info;
 type SharedState = Arc<AppState>;
 const MAX_PREFIX_LEVEL: usize = 4;
 const MAX_WORDS_DISPLAY: usize = 750;
+const SITEMAP_BUCKETS: [&str; 27] = [
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r",
+    "s", "t", "u", "v", "w", "x", "y", "z", "other",
+];
+const TYPEAHEAD_DEFAULT_LIMIT: usize = 12;
+const TYPEAHEAD_MAX_LIMIT: usize = 50;
 type SafeMarkup = MarkupDisplay<HtmlEscaper, String>;
 type SafeJson = SafeMarkup;
 
@@ -195,11 +201,14 @@ fn build_router(state: SharedState, _openapi: bool) -> Router {
         .route("/", get(home))
         .route("/index", get(prefix_index_html))
         .route("/lexeme", get(lexeme_html))
+        .route("/lexeme/:id", get(lexeme_html_by_id))
         .route("/search", get(search_html))
         .route("/api/lexeme", get(api_lexeme))
         .route("/api/search", get(api_search))
+        .route("/api/typeahead", get(api_typeahead))
         .route("/healthz", get(health))
-        .route("/sitemap.xml", get(sitemap_xml))
+        .route("/sitemap.xml", get(sitemap_index))
+        .route("/sitemap-:bucket", get(sitemap_bucket))
         .with_state(state)
         .layer(
             TraceLayer::new_for_http()
@@ -245,8 +254,57 @@ fn render_home(theme: WebTheme, base_url: &str) -> String {
             r#"<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js" integrity="sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI" crossorigin="anonymous"></script>"#,
         ),
     };
-    let title = "OpenGloss • Embedded Dictionary Service";
-    let intro = "Browse lexemes, run fuzzy searches, and view encyclopedia entries from the statically compiled OpenGloss dataset.";
+    let title = "OpenGloss • Friendly Word Explorer";
+    let intro = "Find clear definitions, encyclopedia notes, and related words for more than 150,000 modern English entries.";
+    let typeahead_script = r#"
+    <script>
+      (function() {
+        const input = document.getElementById('home-search-input');
+        const datalist = document.getElementById('home-search-suggestions');
+        const status = document.getElementById('home-search-status');
+        if (!input || !datalist || !status || !window.fetch) {
+          return;
+        }
+        let controller;
+        input.addEventListener('input', async (event) => {
+          const query = event.target.value.trim();
+          if (query.length === 0) {
+            datalist.innerHTML = '';
+            status.textContent = '';
+            return;
+          }
+          if (controller) {
+            controller.abort();
+          }
+          controller = new AbortController();
+          status.textContent = 'Loading suggestions...';
+          const url = `/api/typeahead?q=${encodeURIComponent(query)}&limit=12&mode=prefix`;
+          try {
+            const response = await fetch(url, { signal: controller.signal });
+            if (!response.ok) {
+              status.textContent = '';
+              return;
+            }
+            const payload = await response.json();
+            datalist.innerHTML = '';
+            (payload.suggestions || []).forEach((item) => {
+              const option = document.createElement('option');
+              option.value = item.word;
+              datalist.appendChild(option);
+            });
+            if ((payload.suggestions || []).length === 0) {
+              status.textContent = 'No suggestions yet. Keep typing for more precise matches.';
+            } else {
+              status.textContent = `Showing ${payload.suggestions.length} suggestion${payload.suggestions.length === 1 ? '' : 's'}.`;
+            }
+          } catch (_) {
+            // ignore aborted or failed requests
+            status.textContent = '';
+          }
+        });
+      })();
+    </script>
+    "#;
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -263,18 +321,43 @@ fn render_home(theme: WebTheme, base_url: &str) -> String {
   <body class="{body_class}">
     <main class="{main_class}">
       <div class="{card_class} space-y-6">
-        <div>
+        <section class="space-y-3">
           <p class="{eyebrow_class}">OpenGloss v{version}</p>
-          <h1 class="{headline_class}">Explore the full OpenGloss lexicon via blazing-fast Rust endpoints.</h1>
+          <h1 class="{headline_class}">Your dictionary, encyclopedia, and thesaurus in one stop.</h1>
           <p class="{lede_class}">{intro}</p>
-        </div>
+        </section>
+        <form action="/search" method="get" class="w-full bg-white shadow rounded p-4 flex flex-col gap-3">
+          <label class="text-sm font-semibold text-slate-600" for="home-search-input">Look up a word or phrase</label>
+          <div class="d-flex flex-column flex-md-row gap-3">
+            <input id="home-search-input" name="q" list="home-search-suggestions" placeholder="Try “solar eclipse”, “geometric solid”, “gratitude”…" class="flex-1 form-control px-4 py-2 rounded border border-slate-300 focus:border-slate-500 focus:ring-2 focus:ring-slate-300" />
+            <select name="mode" class="form-select w-full md:w-auto px-3 py-2 rounded border border-slate-300">
+              <option value="fuzzy">Best match</option>
+              <option value="substring">Contains text</option>
+            </select>
+            <button type="submit" class="{button_class} w-full md:w-auto">Search</button>
+          </div>
+          <datalist id="home-search-suggestions">
+          </datalist>
+          <p id="home-search-status" class="text-xs text-slate-500 mb-0"></p>
+        </form>
         <div class="{cta_group}">
-          <a href="/lexeme?word=algorithm" class="{button_class}">Example lexeme</a>
-          <a href="/search?q=gravitation" class="{button_class}">Run a search</a>
-          <a href="/index" class="{button_class}">Browse prefix index</a>
+          <a href="/lexeme?word=algorithm" class="{button_class}">See an example entry</a>
+          <a href="/search?q=gravitation" class="{button_class}">Explore recent searches</a>
+          <a href="/index" class="{button_class}">Browse the word index</a>
         </div>
       </div>
+      <footer class="mt-12 text-center text-sm text-slate-500 space-y-2">
+        <p>Want the geeky bits? Run the bundled CLI or call the JSON API for batch lookups.</p>
+        <p class="text-xs">Suggestions come from an offline trie baked into the Rust binary. Power users can hit <code>/api/typeahead</code> or <code>/api/search</code> directly.</p>
+        <p>
+          Learn why we built OpenGloss in
+          <a href="https://www.arxiv.org/abs/2511.18622" class="text-slate-700 underline hover:text-slate-900" target="_blank" rel="noopener noreferrer">
+            “OpenGloss: A Synthetic Encyclopedic Dictionary and Semantic Knowledge Graph”
+          </a>.
+        </p>
+      </footer>
     </main>
+    {typeahead_script}
   </body>
 </html>"#,
         css_tag = css_tag,
@@ -301,6 +384,21 @@ async fn lexeme_html(
     State(state): State<SharedState>,
     Query(params): Query<LexemeParams>,
 ) -> impl IntoResponse {
+    lexeme_html_inner(state, params).await
+}
+
+async fn lexeme_html_by_id(
+    State(state): State<SharedState>,
+    Path(id): Path<u32>,
+) -> impl IntoResponse {
+    let params = LexemeParams {
+        word: None,
+        id: Some(id),
+    };
+    lexeme_html_inner(state, params).await
+}
+
+async fn lexeme_html_inner(state: SharedState, params: LexemeParams) -> Html<String> {
     match entry_from_params(&params) {
         Ok(entry) => {
             let chrome = Chrome::new(state.theme);
@@ -308,29 +406,39 @@ async fn lexeme_html(
             let json_ld =
                 MarkupDisplay::new_safe(lexeme_json_ld(&entry, &state.base_url), HtmlEscaper);
             let encyclopedia_html = render_markdown(payload.encyclopedia_entry.as_deref());
+            let pos_chips = payload
+                .parts_of_speech
+                .iter()
+                .map(|label| PosChip {
+                    label: label.as_str(),
+                    css_class: pos_chip_class(label),
+                })
+                .collect();
             let senses = payload
                 .senses
                 .iter()
                 .map(|sense| SenseBlock {
                     payload: sense,
                     definition_html: render_markdown(sense.definition.as_deref()),
+                    synonyms: relation_links(&sense.synonyms),
+                    antonyms: relation_links(&sense.antonyms),
+                    hypernyms: relation_links(&sense.hypernyms),
+                    hyponyms: relation_links(&sense.hyponyms),
                 })
                 .collect();
             let sense_count = payload.senses.len();
-            let template = LexemeTemplate {
-                chrome,
-                payload: &payload,
-                canonical_url: absolute_lexeme_url(&state.base_url, entry.word()),
-                json_ld,
-                encyclopedia_html,
-                senses,
-                sense_count,
-            };
-            Html(
-                template
-                    .render()
-                    .unwrap_or_else(|err| render_error_page(state.theme, err.to_string())),
-            )
+    let template = LexemeTemplate {
+        chrome,
+        payload: &payload,
+        canonical_url: absolute_lexeme_url(&state.base_url, entry.word()),
+        json_ld,
+        encyclopedia_html,
+        pos_chips,
+        senses,
+        sense_count,
+        typeahead_header: typeahead_header_html(),
+    };
+            Html(template.render().unwrap_or_else(|err| render_error_page(state.theme, err.to_string())))
         }
         Err(err) => Html(render_error_page(state.theme, err.message)),
     }
@@ -353,11 +461,12 @@ async fn search_html(
                 search_page_json_ld(&payload, &state.base_url),
                 HtmlEscaper,
             );
-            let template = SearchTemplate {
-                chrome,
-                payload: &payload,
-                json_ld,
-            };
+    let template = SearchTemplate {
+        chrome,
+        payload: &payload,
+        json_ld,
+        typeahead_header: typeahead_header_html(),
+    };
             Html(
                 template
                     .render()
@@ -390,6 +499,7 @@ async fn prefix_index_html(
         payload: &payload,
         json_ld,
         base_url: &state.base_url,
+        typeahead_header: typeahead_header_html(),
     };
     Html(
         template
@@ -417,27 +527,74 @@ async fn api_search(
     Ok(Json(payload))
 }
 
-async fn sitemap_xml(State(state): State<SharedState>) -> impl IntoResponse {
-    let mut body = String::with_capacity(1024);
+async fn api_typeahead(
+    Query(params): Query<TypeaheadParams>,
+) -> Result<Json<TypeaheadResponse>, ApiError> {
+    let query = params
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("missing q"))?;
+    let limit = params
+        .limit
+        .unwrap_or(TYPEAHEAD_DEFAULT_LIMIT)
+        .clamp(1, TYPEAHEAD_MAX_LIMIT);
+    let mode = params.mode.unwrap_or(TypeaheadMode::Prefix);
+    let suggestions = match mode {
+        TypeaheadMode::Prefix => LexemeIndex::prefix(query, limit),
+        TypeaheadMode::Substring => LexemeIndex::search_contains(query, limit),
+    }
+    .into_iter()
+    .map(|(word, lexeme_id)| TypeaheadSuggestion { word, lexeme_id })
+    .collect();
+    Ok(Json(TypeaheadResponse {
+        query: query.to_string(),
+        mode,
+        suggestions,
+    }))
+}
+
+async fn sitemap_index(State(state): State<SharedState>) -> impl IntoResponse {
+    let mut body = String::with_capacity(2048);
+    body.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+    body.push_str(r#"<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">"#);
+    for bucket in sitemap_bucket_names() {
+        let loc = format!("{}/sitemap-{}.xml", state.base_url, bucket);
+        body.push_str("<sitemap><loc>");
+        body.push_str(&xml_escape(&loc));
+        body.push_str("</loc></sitemap>");
+    }
+    body.push_str("</sitemapindex>");
+    xml_response(body)
+}
+
+async fn sitemap_bucket(
+    State(state): State<SharedState>,
+    Path(bucket): Path<String>,
+) -> impl IntoResponse {
+    let bucket_normalized = bucket.trim_end_matches(".xml").to_ascii_lowercase();
+    if !sitemap_bucket_names()
+        .iter()
+        .any(|candidate| *candidate == bucket_normalized)
+    {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body("bucket not found".into())
+            .unwrap();
+    }
+    let words = words_for_bucket(&bucket_normalized);
+    let mut body = String::with_capacity(2048);
     body.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
     body.push_str(r#"<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">"#);
-    let mut push_url = |loc: String, priority: &str| {
+    for word in words {
+        let loc = absolute_lexeme_url(&state.base_url, &word);
         body.push_str("<url><loc>");
         body.push_str(&xml_escape(&loc));
-        body.push_str("</loc><changefreq>weekly</changefreq><priority>");
-        body.push_str(priority);
-        body.push_str("</priority></url>");
-    };
-    push_url(state.base_url.clone(), "0.8");
-    push_url(format!("{}/index", state.base_url), "0.7");
-    for (word, _) in LexemeIndex::all_words() {
-        push_url(absolute_lexeme_url(&state.base_url, word), "0.5");
+        body.push_str("</loc><changefreq>weekly</changefreq><priority>0.5</priority></url>");
     }
     body.push_str("</urlset>");
-    Response::builder()
-        .header(axum::http::header::CONTENT_TYPE, "application/xml")
-        .body(body)
-        .unwrap()
+    xml_response(body)
 }
 
 #[derive(Debug, Deserialize)]
@@ -457,6 +614,20 @@ struct SearchParams {
 struct IndexParams {
     letters: Option<usize>,
     prefix: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TypeaheadParams {
+    q: Option<String>,
+    limit: Option<usize>,
+    mode: Option<TypeaheadMode>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Copy, Clone)]
+#[serde(rename_all = "lowercase")]
+enum TypeaheadMode {
+    Prefix,
+    Substring,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -551,6 +722,35 @@ struct IndexPagePayload<'a> {
 struct SenseBlock<'a> {
     payload: &'a SensePayload,
     definition_html: Option<String>,
+    synonyms: Vec<RelationLink>,
+    antonyms: Vec<RelationLink>,
+    hypernyms: Vec<RelationLink>,
+    hyponyms: Vec<RelationLink>,
+}
+
+#[derive(Debug, Clone)]
+struct RelationLink {
+    label: String,
+    href: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TypeaheadResponse {
+    query: String,
+    mode: TypeaheadMode,
+    suggestions: Vec<TypeaheadSuggestion>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TypeaheadSuggestion {
+    word: String,
+    lexeme_id: u32,
+}
+
+#[derive(Debug, Clone)]
+struct PosChip<'a> {
+    label: &'a str,
+    css_class: &'static str,
 }
 
 impl LexemePayload {
@@ -859,6 +1059,94 @@ fn absolute_lexeme_url(base_url: &str, word: &str) -> String {
     format!("{}{}", base_url, lexeme_path(word))
 }
 
+fn sitemap_bucket_names() -> &'static [&'static str] {
+    &SITEMAP_BUCKETS
+}
+
+fn bucket_for_word(word: &str) -> &'static str {
+    if let Some(ch) = word.chars().next() {
+        if ch.is_ascii_alphabetic() {
+            let lower = ch.to_ascii_lowercase() as u8;
+            if (b'a'..=b'z').contains(&lower) {
+                let idx = (lower - b'a') as usize;
+                return SITEMAP_BUCKETS[idx];
+            }
+        }
+    }
+    SITEMAP_BUCKETS[SITEMAP_BUCKETS.len() - 1]
+}
+
+fn words_for_bucket(bucket: &str) -> Vec<String> {
+    LexemeIndex::all_words()
+        .iter()
+        .filter_map(|(word, _)| {
+            if bucket_for_word(word) == bucket {
+                Some(word.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn typeahead_header_html() -> String {
+    r#"
+    <header class="w-full max-w-5xl mb-6">
+      <div class="flex flex-col md:flex-row gap-3 items-start md:items-center justify-between">
+        <a href="/" class="text-sm font-semibold text-slate-600 hover:text-slate-900 flex items-center gap-2">
+          <span aria-hidden="true">←</span> Home
+        </a>
+        <form action="/search" method="get" class="flex flex-col md:flex-row gap-2 w-full md:w-auto" data-role="typeahead-form">
+          <input type="text" name="q" list="shared-typeahead" placeholder="Search lexemes…" class="flex-1 px-3 py-2 rounded border border-slate-300 focus:border-slate-500 focus:ring-2 focus:ring-slate-300" />
+          <select name="mode" class="px-3 py-2 rounded border border-slate-300">
+            <option value="fuzzy">Fuzzy</option>
+            <option value="substring">Substring</option>
+          </select>
+          <button type="submit" class="inline-flex items-center justify-center rounded-full bg-slate-900 text-white px-4 py-2 font-semibold shadow hover:bg-slate-800 transition">🔍</button>
+        </form>
+        <datalist id="shared-typeahead"></datalist>
+      </div>
+    </header>
+    <script>
+      (function() {
+        const datalist = document.getElementById('shared-typeahead');
+        if (!datalist || !window.fetch) return;
+        const forms = document.querySelectorAll('[data-role="typeahead-form"]');
+        forms.forEach((form) => {
+          const input = form.querySelector('input[name="q"]');
+          if (!input) return;
+          let controller;
+          input.addEventListener('input', async (event) => {
+            const query = event.target.value.trim();
+            if (!query) {
+              datalist.innerHTML = '';
+              return;
+            }
+            if (controller) controller.abort();
+            controller = new AbortController();
+            const url = `/api/typeahead?q=${encodeURIComponent(query)}&limit=10&mode=prefix`;
+            try {
+              const response = await fetch(url, { signal: controller.signal });
+              if (!response.ok) return;
+              const payload = await response.json();
+              datalist.innerHTML = '';
+              (payload.suggestions || []).forEach((item) => {
+                const option = document.createElement('option');
+                option.value = item.word;
+                datalist.appendChild(option);
+              });
+            } catch (_) {
+              // ignore failures
+            }
+          });
+        });
+      })();
+    </script>
+    "#
+    .to_string()
+}
+
+
 fn defined_term_set_json_ld(base_url: &str) -> String {
     let index_url = format!("{base}/index", base = base_url);
     serde_json::to_string_pretty(&json!({
@@ -986,6 +1274,14 @@ fn indent_json(content: &str, spaces: usize) -> String {
         .join("\n")
 }
 
+fn xml_response(body: String) -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/xml")],
+        body,
+    )
+        .into_response()
+}
+
 fn xml_escape(input: &str) -> String {
     input
         .replace('&', "&amp;")
@@ -1016,6 +1312,48 @@ fn render_markdown_str(input: &str) -> Option<String> {
     let options = markdown_options();
     let html = to_html_with_options(trimmed, &options).unwrap_or_else(|_| trimmed.to_string());
     Some(html)
+}
+
+fn relation_links(terms: &[String]) -> Vec<RelationLink> {
+    terms
+        .iter()
+        .map(|term| {
+            let href = LexemeIndex::entry_by_word(term)
+                .map(|_| lexeme_path(term));
+            RelationLink {
+                label: term.clone(),
+                href,
+            }
+        })
+        .collect()
+}
+
+fn pos_chip_class(label: &str) -> &'static str {
+    let normalized = label.to_ascii_lowercase();
+    let text = normalized.as_str();
+    if text.contains("noun") {
+        "pos-chip-noun"
+    } else if text.contains("verb") {
+        "pos-chip-verb"
+    } else if text.contains("adjective") || text.contains("adj") {
+        "pos-chip-adjective"
+    } else if text.contains("adverb") {
+        "pos-chip-adverb"
+    } else if text.contains("pronoun") {
+        "pos-chip-pronoun"
+    } else if text.contains("determiner") || text.contains("det") {
+        "pos-chip-determiner"
+    } else if text.contains("preposition") {
+        "pos-chip-preposition"
+    } else if text.contains("conjunction") {
+        "pos-chip-conjunction"
+    } else if text.contains("interjection") {
+        "pos-chip-interjection"
+    } else if text.contains("numeral") || text.contains("number") {
+        "pos-chip-numeral"
+    } else {
+        ""
+    }
 }
 
 #[derive(Template)]
@@ -1064,6 +1402,95 @@ fn render_markdown_str(input: &str) -> Option<String> {
       .rich-text > :last-child {
         margin-bottom: 0;
       }
+      .pos-chip {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.35rem 0.9rem;
+        border-radius: 9999px;
+        background-color: rgba(15, 23, 42, 0.05);
+        border: 1px solid rgba(15, 23, 42, 0.08);
+        color: #334155;
+        font-size: 0.875rem;
+        font-weight: 600;
+      }
+      .pos-chip-noun {
+        background-color: #eef2ff;
+        border-color: #c7d2fe;
+        color: #312e81;
+      }
+      .pos-chip-verb {
+        background-color: #ecfdf5;
+        border-color: #a7f3d0;
+        color: #065f46;
+      }
+      .pos-chip-adjective {
+        background-color: #fff7ed;
+        border-color: #fed7aa;
+        color: #92400e;
+      }
+      .pos-chip-adverb {
+        background-color: #f4f3ff;
+        border-color: #c4b5fd;
+        color: #4c1d95;
+      }
+      .pos-chip-pronoun {
+        background-color: #f0fdfa;
+        border-color: #99f6e4;
+        color: #115e59;
+      }
+      .pos-chip-determiner {
+        background-color: #fef2f2;
+        border-color: #fecaca;
+        color: #991b1b;
+      }
+      .pos-chip-preposition {
+        background-color: #eff6ff;
+        border-color: #bfdbfe;
+        color: #1d4ed8;
+      }
+      .pos-chip-conjunction {
+        background-color: #fdf2f8;
+        border-color: #fbcfe8;
+        color: #9d174d;
+      }
+      .pos-chip-interjection {
+        background-color: #faf5ff;
+        border-color: #e9d5ff;
+        color: #6b21a8;
+      }
+      .pos-chip-numeral {
+        background-color: #f5f5f4;
+        border-color: #e7e5e4;
+        color: #44403c;
+      }
+      .relation-chip-group {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.45rem;
+      }
+      .relation-chip {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.25rem 0.85rem;
+        border-radius: 9999px;
+        background-color: rgba(15, 23, 42, 0.07);
+        color: #0f172a;
+        border: 1px solid rgba(15, 23, 42, 0.12);
+        font-size: 0.85rem;
+        text-decoration: none;
+        transition: background-color 150ms ease, color 150ms ease;
+      }
+      .relation-chip:hover {
+        background-color: rgba(15, 23, 42, 0.12);
+        color: #020617;
+        text-decoration: none;
+      }
+      .relation-chip-disabled {
+        cursor: not-allowed;
+        opacity: 0.6;
+        background-color: rgba(15, 23, 42, 0.04);
+        border-style: dashed;
+      }
     </style>
     <script type="application/ld+json">
     {{ json_ld }}
@@ -1071,6 +1498,7 @@ fn render_markdown_str(input: &str) -> Option<String> {
   </head>
   <body class="{{ chrome.body_class }}">
     <main class="{{ chrome.main_class }}">
+      {{ typeahead_header|safe }}
       <div class="{{ chrome.card_class }} space-y-6">
         <div>
           <p class="{{ chrome.eyebrow_class }}">Lexeme #{{ payload.lexeme_id }}</p>
@@ -1125,12 +1553,12 @@ fn render_markdown_str(input: &str) -> Option<String> {
           </div>
         </section>
 
-        {% if payload.parts_of_speech.len() > 0 %}
+        {% if pos_chips.len() > 0 %}
         <section id="parts-of-speech">
           <h2 class="text-xl font-semibold mb-2">Parts of speech</h2>
           <div class="flex flex-wrap gap-2 d-flex">
-            {% for pos in payload.parts_of_speech %}
-            <span class="px-3 py-1 rounded-full bg-slate-200 text-sm">{{ pos }}</span>
+            {% for chip in pos_chips %}
+            <span class="pos-chip {{ chip.css_class }}">{{ chip.label }}</span>
             {% endfor %}
           </div>
         </section>
@@ -1154,27 +1582,61 @@ fn render_markdown_str(input: &str) -> Option<String> {
                   <p>Definition unavailable</p>
                 {% endif %}
               </div>
-              {% if sense.payload.synonyms.len() > 0 %}
-              <p><strong>Synonyms:</strong>
-                {% for syn in sense.payload.synonyms %}
-                  {% if loop.first %}
-                    {{ syn }}
+              {% if sense.synonyms.len() > 0 %}
+              <div class="mt-3">
+                <p class="font-semibold mb-1">Synonyms</p>
+                <div class="relation-chip-group">
+                  {% for syn in sense.synonyms %}
+                  {% if syn.href.is_some() %}
+                  <a href="{{ syn.href.as_ref().unwrap() }}" class="relation-chip">{{ syn.label }}</a>
                   {% else %}
-                    , {{ syn }}
+                  <span class="relation-chip relation-chip-disabled">{{ syn.label }}</span>
                   {% endif %}
-                {% endfor %}
-              </p>
+                  {% endfor %}
+                </div>
+              </div>
               {% endif %}
-              {% if sense.payload.antonyms.len() > 0 %}
-              <p><strong>Antonyms:</strong>
-                {% for ant in sense.payload.antonyms %}
-                  {% if loop.first %}
-                    {{ ant }}
+              {% if sense.antonyms.len() > 0 %}
+              <div class="mt-3">
+                <p class="font-semibold mb-1">Antonyms</p>
+                <div class="relation-chip-group">
+                  {% for ant in sense.antonyms %}
+                  {% if ant.href.is_some() %}
+                  <a href="{{ ant.href.as_ref().unwrap() }}" class="relation-chip">{{ ant.label }}</a>
                   {% else %}
-                    , {{ ant }}
+                  <span class="relation-chip relation-chip-disabled">{{ ant.label }}</span>
                   {% endif %}
-                {% endfor %}
-              </p>
+                  {% endfor %}
+                </div>
+              </div>
+              {% endif %}
+              {% if sense.hypernyms.len() > 0 %}
+              <div class="mt-3">
+                <p class="font-semibold mb-1">Hypernyms</p>
+                <div class="relation-chip-group">
+                  {% for hyper in sense.hypernyms %}
+                  {% if hyper.href.is_some() %}
+                  <a href="{{ hyper.href.as_ref().unwrap() }}" class="relation-chip">{{ hyper.label }}</a>
+                  {% else %}
+                  <span class="relation-chip relation-chip-disabled">{{ hyper.label }}</span>
+                  {% endif %}
+                  {% endfor %}
+                </div>
+              </div>
+              {% endif %}
+              {% if sense.hyponyms.len() > 0 %}
+              <div class="mt-3">
+                <p class="font-semibold mb-1">Hyponyms</p>
+                <div class="relation-chip-group">
+                  {% for hypo in sense.hyponyms %}
+                  {% if hypo.href.is_some() %}
+                  <a href="{{ hypo.href.as_ref().unwrap() }}" class="relation-chip">{{ hypo.label }}</a>
+                  {% else %}
+                  <span class="relation-chip relation-chip-disabled">{{ hypo.label }}</span>
+                  {% endif %}
+                  {% endfor %}
+                </div>
+              </div>
               {% endif %}
               {% if sense.payload.examples.len() > 0 %}
               <div class="mt-3">
@@ -1209,8 +1671,10 @@ struct LexemeTemplate<'a> {
     canonical_url: String,
     json_ld: SafeJson,
     encyclopedia_html: Option<String>,
+    pos_chips: Vec<PosChip<'a>>,
     senses: Vec<SenseBlock<'a>>,
     sense_count: usize,
+    typeahead_header: String,
 }
 
 #[derive(Template)]
@@ -1234,6 +1698,7 @@ struct LexemeTemplate<'a> {
   </head>
   <body class="{{ chrome.body_class }}">
     <main class="{{ chrome.main_class }}">
+      {{ typeahead_header|safe }}
       <div class="{{ chrome.card_class }} space-y-4">
         <div>
           <p class="{{ chrome.eyebrow_class }}">Mode: {{ payload.mode }}</p>
@@ -1282,6 +1747,7 @@ struct SearchTemplate<'a> {
     chrome: Chrome,
     payload: &'a SearchResponsePayload,
     json_ld: SafeJson,
+    typeahead_header: String,
 }
 
 #[derive(Template)]
@@ -1306,6 +1772,7 @@ struct SearchTemplate<'a> {
   </head>
   <body class="{{ chrome.body_class }}">
     <main class="{{ chrome.main_class }}">
+      {{ typeahead_header|safe }}
       <div class="{{ chrome.card_class }} space-y-6">
         <div>
           <p class="{{ chrome.eyebrow_class }}">Prefix depth ≤ {{ payload.letters }}</p>
@@ -1355,6 +1822,7 @@ struct IndexTemplate<'a> {
     payload: &'a IndexPagePayload<'a>,
     json_ld: SafeJson,
     base_url: &'a str,
+    typeahead_header: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Default)]
@@ -1438,6 +1906,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_typeahead_prefix() {
+        let router = test_router();
+        let response = router
+            .oneshot(
+                Request::get("/api/typeahead?q=do&mode=prefix&limit=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: TypeaheadResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload.query, "do");
+        assert!(!payload.suggestions.is_empty());
+    }
+
+    #[tokio::test]
     async fn index_page_renders() {
         let router = test_router();
         let response = router
@@ -1452,7 +1940,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sitemap_contains_home() {
+    async fn sitemap_index_lists_bucket_files() {
         let router = test_router();
         let response = router
             .oneshot(Request::get("/sitemap.xml").body(Body::empty()).unwrap())
@@ -1463,8 +1951,23 @@ mod tests {
             .await
             .unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(text.contains("<urlset"));
-        assert!(text.contains("http://127.0.0.1:8080"));
+        assert!(text.contains("<sitemapindex"));
+        assert!(text.contains("sitemap-a.xml"));
+    }
+
+    #[tokio::test]
+    async fn sitemap_bucket_contains_words() {
+        let router = test_router();
+        let response = router
+            .oneshot(Request::get("/sitemap-d.xml").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("/lexeme?word=dog"));
     }
 
     #[tokio::test]
@@ -1532,6 +2035,74 @@ mod tests {
         assert!(
             html.contains("<iframe src=\"https://example.com\"></iframe>"),
             "GFM tag filter must be disabled so embeddable HTML survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexeme_route_accepts_id_path() {
+        let router = test_router();
+        let entry = LexemeIndex::entry_by_word("dog").expect("dog lexeme");
+        let uri = format!("/lexeme/{}", entry.lexeme_id());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            html.to_lowercase().contains("dog"),
+            "lexeme page should mention the resolved word"
+        );
+    }
+
+    #[tokio::test]
+    async fn relation_terms_link_to_lexemes() {
+        let router = test_router();
+        let word = "3d object";
+        let uri = format!("/lexeme?word={}", encode_component(word));
+        let response = router
+            .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        let entry = LexemeIndex::entry_by_word(word).expect("lexeme present");
+        if let Some(linkable) = entry
+            .all_synonyms()
+            .find(|term| LexemeIndex::entry_by_word(term).is_some())
+        {
+            let expected_href = format!("href=\"{}\"", lexeme_path(linkable));
+            assert!(
+                html.contains(&expected_href),
+                "synonym {linkable} should link to its lexeme page"
+            );
+        } else {
+            assert!(
+                html.contains("relation-chip-disabled"),
+                "fallback chips should render when synonyms are missing"
+            );
+        }
+    }
+
+    #[test]
+    fn relation_links_skip_missing_words() {
+        let links = relation_links(&[String::from("this-word-should-not-exist")]);
+        assert_eq!(links.len(), 1);
+        assert!(
+            links[0].href.is_none(),
+            "missing lexemes should not produce hyperlinks"
         );
     }
 }

@@ -148,20 +148,28 @@ Logging is wired up via `tracing_subscriber` with an `info`-level default. Overr
 
 - `GET /index?letters=<n>&prefix=<abc>`: interactive lexeme index that groups every entry by
   configurable prefix depth (1–4 letters) and shows the first 750 matches for the selected prefix.
-- `GET /sitemap.xml`: auto-generated sitemap with canonical URLs for every lexeme plus the home and
+- `GET /sitemap.xml`: sitemap index that fans out to `/sitemap-a.xml` … `/sitemap-z.xml` (plus
+  `/sitemap-other.xml`) so crawlers can ingest canonical URLs for every lexeme alongside the home and
   index pages. Point search consoles at this endpoint once you host the explorer publicly.
 
 ### HTML explorer
 
 - `GET /`: landing page with quick links.
 - `GET /lexeme?word=<word>` or `?id=<lexeme_id>`: rendered entry view.
+- `GET /lexeme/<lexeme_id>`: same lexeme view addressed directly by numeric ID.
 - `GET /search?q=<query>&mode=fuzzy|substring&limit=<n>`: table of search hits with deep links to
   `/lexeme`.
 - `GET /index`: browsable prefix index described above.
+- `/` also now includes a first-class search form backed by the embedded trie; the datalist suggestions
+  refresh from the compiled lexicon and gracefully degrade to a regular `<form>` submit.
 
 Lexeme pages now open with an overview strip that surfaces how many senses exist, the
 part-of-speech distribution, and whether an encyclopedia article is available, plus quick navigation
-chips to jump straight to the senses or encyclopedia section.
+chips to jump straight to the senses or encyclopedia section. Every synonym/antonym/hypernym/hyponym
+is rendered as a muted chip that links to the corresponding `/lexeme?word=...` view, making it easy
+to traverse the network.
+Parts-of-speech badges use subtle color coding (nouns, verbs, adjectives, etc.) so readers can spot the
+distribution at a glance.
 
 Entry bodies, aggregated definitions, and encyclopedia articles are authored in Markdown inside the
 dataset; the web explorer renders them to HTML via [`markdown-rs`](https://github.com/wooorm/markdown-rs)
@@ -173,6 +181,7 @@ so headings, emphasis, tables, and lists survive intact.
 | --- | --- | --- | --- |
 | `GET` | `/api/lexeme` | `word=<string>` **or** `id=<u32>` | Returns the full `LexemePayload` (entry metadata, senses, relations, encyclopedia text). |
 | `GET` | `/api/search` | `q=<string>&mode=fuzzy|substring&limit=1..100` | Returns `results[]` with lexeme IDs, forms, and optional scores (for fuzzy mode). |
+| `GET` | `/api/typeahead` | `q=<string>&mode=prefix|substring&limit=1..50` | Lightweight suggestions endpoint backed by the lexeme trie, suitable for type-ahead inputs. |
 | `GET` | `/healthz` | *(none)* | Simple readiness probe emitting `{ "status": "ok" }`. |
 
 Sample interactions:
