@@ -10,14 +10,14 @@
   - [x] Build Axum router with `TraceLayer`, `CompressionLayer`, health endpoints, and graceful shutdown.
 
 - [ ] **JSON/OpenAPI endpoints**
-  - [x] Define DTOs (`Serialize`, `Deserialize`) and implement `/api/lexeme` + `/api/search`.
-  - [ ] Add graph/encyclopedia APIs and derive `ToSchema`.
-  - [ ] Generate OpenAPI doc + serve `/openapi.json` + `/docs` (Swagger UI) behind `web-openapi`.
+  - [x] Define DTOs (`Serialize`, `Deserialize`) and implement `/api/lexeme`, `/api/search`, and `/api/typeahead`.
+  - [ ] Add graph/encyclopedia APIs and derive `ToSchema` for those payloads.
+  - [ ] Generate/serve OpenAPI (`/openapi.json`, Swagger UI) behind the `web-openapi` feature flag.
 
 - [ ] **HTML rendering pipeline**
-  - [x] Add `askama` templates for search + lexeme pages with Tailwind/Bootstrap chrome.
-  - [ ] Add templates for graph/encyclopedia and markdown rendering.
-  - [ ] Integrate richer content negotiation and theme customization.
+  - [x] Add `askama` templates for home, search, lexeme, and index pages with Tailwind/Bootstrap chrome plus markdown rendering via `markdown-rs`.
+  - [ ] Add templates for graph visualizations / encyclopedia explorer views.
+  - [ ] Integrate richer content negotiation and theme customization (per-request CSS framework, JSON/HTML auto-switching).
 
 - [ ] **Static assets**
   - [ ] Create `static/` directory for CSS/JS/logo; serve via `ServeDir` and embed for release builds.
@@ -26,10 +26,13 @@
   - [ ] Build Askama partials for neighbor trees, DOT download links, minimal JS enhancements.
 
 - [ ] **OpenAPI + documentation**
-  - [ ] Document endpoints and features in README/RELEASING; ensure schema coverage.
+  - [x] Document CLI, web server, and API usage in README/RELEASING.
+  - [ ] Ensure OpenAPI schema coverage matches shipped endpoints; publish docs alongside releases.
 
 - [ ] **Testing & benchmarking**
-  - [ ] Add integration tests for JSON/HTML responses; extend benches if needed.
+  - [x] Add integration tests for `/api/*`, `/lexeme`, `/index`, and markdown rendering.
+  - [ ] Extend benches / add perf tests for trie/typeahead + web handlers if regressions appear.
 
 - [ ] **Deployment polish**
-  - [ ] Update release packaging for `web` builds; add docker/systemd guidance.
+  - [x] Update release packaging for web builds (full-feature tarball + checksum).
+  - [ ] Add docker/systemd guidance and sample configs.
