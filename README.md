@@ -155,6 +155,7 @@ Logging is wired up via `tracing_subscriber` with an `info`-level default. Overr
 ### HTML explorer
 
 - `GET /`: landing page with quick links.
+- `GET /random`: redirects to a randomly selected lexeme (used by the “Random word” button).
 - `GET /lexeme?word=<word>` or `?id=<lexeme_id>`: rendered entry view.
 - `GET /lexeme/<lexeme_id>`: same lexeme view addressed directly by numeric ID.
 - `GET /search?q=<query>&mode=fuzzy|substring&limit=<n>`: table of search hits with deep links to
@@ -162,8 +163,8 @@ Logging is wired up via `tracing_subscriber` with an `info`-level default. Overr
 - `GET /index`: browsable prefix index described above.
 - `/` now ships with a custom type-ahead dropdown backed by the embedded trie so the first dozen
   matches stream in as you type (with a plain `<form>` fallback). Quick links jump to a curated
-  example (`farm`), the prefix index, or a “Random word” surprise button when you just want to
-  explore.
+  example (`farm`), the prefix index, or a “Random word” button wired to `/random`, which redirects
+  to a fresh lexeme on each click.
 
 Lexeme pages now open with an overview strip that surfaces how many senses exist, the
 part-of-speech distribution, and whether an encyclopedia article is available, plus quick navigation

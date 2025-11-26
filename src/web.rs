@@ -5,7 +5,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
 use markdown::{Options as MarkdownOptions, to_html_with_options};
@@ -200,6 +200,7 @@ impl IntoResponse for ApiError {
 fn build_router(state: SharedState, _openapi: bool) -> Router {
     Router::new()
         .route("/", get(home))
+        .route("/random", get(random_redirect))
         .route("/index", get(prefix_index_html))
         .route("/lexeme", get(lexeme_html))
         .route("/lexeme/:id", get(lexeme_html_by_id))
@@ -243,6 +244,11 @@ async fn home(State(state): State<SharedState>) -> impl IntoResponse {
     Html(render_home(state.theme, &state.base_url))
 }
 
+async fn random_redirect() -> impl IntoResponse {
+    let target = random_lexeme_path().unwrap_or_else(|| lexeme_path("encyclopedia"));
+    Redirect::temporary(&target)
+}
+
 fn render_home(theme: WebTheme, base_url: &str) -> String {
     let chrome = Chrome::new(theme);
     let (css_tag, js_tag) = match theme {
@@ -258,7 +264,6 @@ fn render_home(theme: WebTheme, base_url: &str) -> String {
     let title = "OpenGloss • Friendly Word Explorer";
     let intro = "Find clear definitions, encyclopedia notes, and related words for more than 150,000 modern English entries.";
     let typeahead_script = TYPEAHEAD_WIDGET;
-    let lucky_link = random_lexeme_path().unwrap_or_else(|| lexeme_path("encyclopedia"));
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -298,7 +303,7 @@ fn render_home(theme: WebTheme, base_url: &str) -> String {
         <div class="{cta_group}">
           <a href="/lexeme?word=farm" class="{button_class}">See an example entry</a>
           <a href="/index" class="{button_class}">Browse the word index</a>
-          <a href="{lucky_link}" class="{button_class}">Random word</a>
+          <a href="/random" class="{button_class}">Random word</a>
         </div>
       </div>
       <footer class="mt-12 text-center text-sm text-slate-500 space-y-2">
@@ -327,7 +332,6 @@ fn render_home(theme: WebTheme, base_url: &str) -> String {
         button_class = chrome.button_class,
         version = env!("CARGO_PKG_VERSION"),
         intro = intro,
-        lucky_link = lucky_link,
         site_json_ld = indent_json(&website_json_ld(base_url), 4),
     )
 }
@@ -2043,7 +2047,7 @@ impl fmt::Display for SearchModeParam {
 #[cfg(all(test, feature = "web"))]
 mod tests {
     use super::*;
-    use axum::{body, body::Body, http::Request};
+    use axum::{body, body::Body, http::{header, Request}};
     use tower::ServiceExt;
 
     fn test_router() -> Router {
@@ -2307,6 +2311,25 @@ mod tests {
                 "fallback chips should render when synonyms are missing"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn random_route_redirects_to_lexeme() {
+        let router = test_router();
+        let response = router
+            .oneshot(Request::get("/random").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .expect("redirect location header");
+        let target = location.to_str().expect("valid utf-8");
+        assert!(
+            target.starts_with("/lexeme?word="),
+            "random redirect should land on a lexeme query, got {target}"
+        );
     }
 
     #[test]
