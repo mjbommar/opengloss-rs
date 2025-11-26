@@ -160,8 +160,10 @@ Logging is wired up via `tracing_subscriber` with an `info`-level default. Overr
 - `GET /search?q=<query>&mode=fuzzy|substring&limit=<n>`: table of search hits with deep links to
   `/lexeme`.
 - `GET /index`: browsable prefix index described above.
-- `/` also now includes a first-class search form backed by the embedded trie; the datalist suggestions
-  refresh from the compiled lexicon and gracefully degrade to a regular `<form>` submit.
+- `/` now ships with a custom type-ahead dropdown backed by the embedded trie so the first dozen
+  matches stream in as you type (with a plain `<form>` fallback). Quick links jump to a curated
+  example (`farm`), the prefix index, or a “Random word” surprise button when you just want to
+  explore.
 
 Lexeme pages now open with an overview strip that surfaces how many senses exist, the
 part-of-speech distribution, and whether an encyclopedia article is available, plus quick navigation

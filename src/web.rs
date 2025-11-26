@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tower_http::compression::CompressionLayer;
@@ -256,55 +257,8 @@ fn render_home(theme: WebTheme, base_url: &str) -> String {
     };
     let title = "OpenGloss • Friendly Word Explorer";
     let intro = "Find clear definitions, encyclopedia notes, and related words for more than 150,000 modern English entries.";
-    let typeahead_script = r#"
-    <script>
-      (function() {
-        const input = document.getElementById('home-search-input');
-        const datalist = document.getElementById('home-search-suggestions');
-        const status = document.getElementById('home-search-status');
-        if (!input || !datalist || !status || !window.fetch) {
-          return;
-        }
-        let controller;
-        input.addEventListener('input', async (event) => {
-          const query = event.target.value.trim();
-          if (query.length === 0) {
-            datalist.innerHTML = '';
-            status.textContent = '';
-            return;
-          }
-          if (controller) {
-            controller.abort();
-          }
-          controller = new AbortController();
-          status.textContent = 'Loading suggestions...';
-          const url = `/api/typeahead?q=${encodeURIComponent(query)}&limit=12&mode=prefix`;
-          try {
-            const response = await fetch(url, { signal: controller.signal });
-            if (!response.ok) {
-              status.textContent = '';
-              return;
-            }
-            const payload = await response.json();
-            datalist.innerHTML = '';
-            (payload.suggestions || []).forEach((item) => {
-              const option = document.createElement('option');
-              option.value = item.word;
-              datalist.appendChild(option);
-            });
-            if ((payload.suggestions || []).length === 0) {
-              status.textContent = 'No suggestions yet. Keep typing for more precise matches.';
-            } else {
-              status.textContent = `Showing ${payload.suggestions.length} suggestion${payload.suggestions.length === 1 ? '' : 's'}.`;
-            }
-          } catch (_) {
-            // ignore aborted or failed requests
-            status.textContent = '';
-          }
-        });
-      })();
-    </script>
-    "#;
+    let typeahead_script = TYPEAHEAD_WIDGET;
+    let lucky_link = random_lexeme_path().unwrap_or_else(|| lexeme_path("encyclopedia"));
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -326,24 +280,25 @@ fn render_home(theme: WebTheme, base_url: &str) -> String {
           <h1 class="{headline_class}">Your dictionary, encyclopedia, and thesaurus in one stop.</h1>
           <p class="{lede_class}">{intro}</p>
         </section>
-        <form action="/search" method="get" class="w-full bg-white shadow rounded p-4 flex flex-col gap-3">
+        <form action="/search" method="get" class="w-full bg-white shadow rounded p-4 flex flex-col gap-3" data-role="typeahead-form">
           <label class="text-sm font-semibold text-slate-600" for="home-search-input">Look up a word or phrase</label>
           <div class="d-flex flex-column flex-md-row gap-3">
-            <input id="home-search-input" name="q" list="home-search-suggestions" placeholder="Try “solar eclipse”, “geometric solid”, “gratitude”…" class="flex-1 form-control px-4 py-2 rounded border border-slate-300 focus:border-slate-500 focus:ring-2 focus:ring-slate-300" />
+            <div class="flex-1 position-relative relative">
+              <input id="home-search-input" name="q" data-role="typeahead-input" placeholder="Try “solar eclipse”, “geometric solid”, “gratitude”…" class="w-full form-control px-4 py-2 rounded border border-slate-300 focus:border-slate-500 focus:ring-2 focus:ring-slate-300" autocomplete="off" />
+              <div class="typeahead-panel" data-role="typeahead-panel" role="listbox" hidden></div>
+            </div>
             <select name="mode" class="form-select w-full md:w-auto px-3 py-2 rounded border border-slate-300">
               <option value="fuzzy">Best match</option>
               <option value="substring">Contains text</option>
             </select>
             <button type="submit" class="{button_class} w-full md:w-auto">Search</button>
           </div>
-          <datalist id="home-search-suggestions">
-          </datalist>
-          <p id="home-search-status" class="text-xs text-slate-500 mb-0"></p>
+          <p id="home-search-status" data-role="typeahead-status" class="text-xs text-slate-500 mb-0"></p>
         </form>
         <div class="{cta_group}">
-          <a href="/lexeme?word=algorithm" class="{button_class}">See an example entry</a>
-          <a href="/search?q=gravitation" class="{button_class}">Explore recent searches</a>
+          <a href="/lexeme?word=farm" class="{button_class}">See an example entry</a>
           <a href="/index" class="{button_class}">Browse the word index</a>
+          <a href="{lucky_link}" class="{button_class}">Random word</a>
         </div>
       </div>
       <footer class="mt-12 text-center text-sm text-slate-500 space-y-2">
@@ -372,9 +327,184 @@ fn render_home(theme: WebTheme, base_url: &str) -> String {
         button_class = chrome.button_class,
         version = env!("CARGO_PKG_VERSION"),
         intro = intro,
+        lucky_link = lucky_link,
         site_json_ld = indent_json(&website_json_ld(base_url), 4),
     )
 }
+
+const TYPEAHEAD_WIDGET: &str = r#"
+<style>
+  .typeahead-panel {
+    position: absolute;
+    top: calc(100% + 0.25rem);
+    left: 0;
+    right: 0;
+    z-index: 20;
+    background: #fff;
+    border: 1px solid rgba(100, 116, 139, 0.4);
+    border-radius: 0.65rem;
+    box-shadow: 0 15px 35px rgba(15, 23, 42, 0.15);
+    max-height: 16rem;
+    overflow-y: auto;
+  }
+  .typeahead-panel[hidden] {
+    display: none;
+  }
+  .typeahead-option {
+    width: 100%;
+    text-align: left;
+    padding: 0.5rem 0.9rem;
+    border: none;
+    background: transparent;
+    font-size: 0.95rem;
+    color: #0f172a;
+    cursor: pointer;
+  }
+  .typeahead-option + .typeahead-option {
+    border-top: 1px solid rgba(148, 163, 184, 0.3);
+  }
+  .typeahead-option.is-active,
+  .typeahead-option:hover,
+  .typeahead-option:focus {
+    background: rgba(148, 163, 184, 0.18);
+    outline: none;
+  }
+</style>
+<script>
+  (function() {
+    if (!window.fetch) return;
+    const forms = document.querySelectorAll('[data-role="typeahead-form"]');
+    const formatStatus = (count) => {
+      if (!count) return 'No quick matches yet.';
+      if (count === 1) return 'Showing 1 quick match.';
+      return `Showing ${count} quick matches.`;
+    };
+    forms.forEach((form) => {
+      const input = form.querySelector('[data-role="typeahead-input"]');
+      const panel = form.querySelector('[data-role="typeahead-panel"]');
+      const status = form.querySelector('[data-role="typeahead-status"]');
+      if (!input || !panel) return;
+      let controller;
+      let suggestions = [];
+      let activeIndex = -1;
+      const hidePanel = () => {
+        panel.setAttribute('hidden', 'hidden');
+        panel.innerHTML = '';
+        activeIndex = -1;
+        activeIndex = -1;
+      };
+      const showPanel = () => {
+        panel.removeAttribute('hidden');
+      };
+      const updateStatus = (message) => {
+        if (status) status.textContent = message || '';
+      };
+      const highlight = (index) => {
+        const nodes = panel.querySelectorAll('[data-role="typeahead-option"]');
+        nodes.forEach((node, nodeIndex) => {
+          if (nodeIndex === index) {
+            node.classList.add('is-active');
+            node.setAttribute('aria-selected', 'true');
+            node.scrollIntoView({ block: 'nearest' });
+            activeIndex = index;
+          } else {
+            node.classList.remove('is-active');
+            node.setAttribute('aria-selected', 'false');
+          }
+        });
+      };
+      const navigateTo = (word) => {
+        if (!word) return;
+        window.location.href = `/lexeme?word=${encodeURIComponent(word)}`;
+      };
+      const renderSuggestions = () => {
+        panel.innerHTML = '';
+        panel.scrollTop = 0;
+        suggestions.forEach((item) => {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'typeahead-option';
+          button.textContent = item.word;
+          button.setAttribute('data-role', 'typeahead-option');
+          button.setAttribute('role', 'option');
+          button.setAttribute('aria-selected', 'false');
+          button.addEventListener('pointerdown', (event) => event.preventDefault());
+          button.addEventListener('click', () => {
+            navigateTo(item.word);
+          });
+          panel.appendChild(button);
+        });
+        if (suggestions.length === 0) {
+          hidePanel();
+        } else {
+          showPanel();
+        }
+      };
+      const fetchSuggestions = async (query) => {
+        if (controller) controller.abort();
+        controller = new AbortController();
+        updateStatus('Loading quick matches…');
+        try {
+          const response = await fetch(`/api/typeahead?q=${encodeURIComponent(query)}&limit=12&mode=prefix`, { signal: controller.signal });
+          if (!response.ok) {
+            hidePanel();
+            updateStatus('');
+            return;
+          }
+          const payload = await response.json();
+          suggestions = payload.suggestions || [];
+          renderSuggestions();
+          updateStatus(formatStatus(suggestions.length));
+        } catch (error) {
+          if (error.name === 'AbortError') return;
+          hidePanel();
+          updateStatus('');
+        }
+      };
+      input.addEventListener('input', (event) => {
+        const query = event.target.value.trim();
+        if (!query) {
+          hidePanel();
+          updateStatus('');
+          if (controller) controller.abort();
+          return;
+        }
+        fetchSuggestions(query);
+      });
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          hidePanel();
+          updateStatus('');
+          return;
+        }
+        if (panel.hasAttribute('hidden') || !suggestions.length) return;
+        if (event.key === 'ArrowDown') {
+          event.preventDefault();
+          const next = activeIndex + 1 >= suggestions.length ? 0 : activeIndex + 1;
+          highlight(next);
+          return;
+        }
+        if (event.key === 'ArrowUp') {
+          event.preventDefault();
+          const next = activeIndex - 1 < 0 ? suggestions.length - 1 : activeIndex - 1;
+          highlight(next);
+          return;
+        }
+        if (event.key === 'Enter' && activeIndex >= 0 && suggestions[activeIndex]) {
+          event.preventDefault();
+          navigateTo(suggestions[activeIndex].word);
+          return;
+        }
+      });
+      document.addEventListener('click', (event) => {
+        if (!form.contains(event.target)) {
+          hidePanel();
+        }
+      });
+    });
+  })();
+</script>
+"#;
 
 async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok", "service": "opengloss-web" }))
@@ -1067,6 +1197,19 @@ fn lexeme_path(word: &str) -> String {
     format!("/lexeme?word={}", encode_component(word))
 }
 
+fn random_lexeme_path() -> Option<String> {
+    let words = LexemeIndex::all_words();
+    if words.is_empty() {
+        return None;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let idx = (nanos % words.len() as u128) as usize;
+    Some(lexeme_path(words[idx].0.as_str()))
+}
+
 fn absolute_lexeme_url(base_url: &str, word: &str) -> String {
     format!("{}{}", base_url, lexeme_path(word))
 }
@@ -1102,60 +1245,30 @@ fn words_for_bucket(bucket: &str) -> Vec<String> {
 }
 
 fn typeahead_header_html() -> String {
-    r#"
+    format!(
+        r#"
     <header class="w-full max-w-5xl mb-6">
       <div class="flex flex-col md:flex-row gap-3 items-start md:items-center justify-between">
         <a href="/" class="text-sm font-semibold text-slate-600 hover:text-slate-900 flex items-center gap-2">
           <span aria-hidden="true">←</span> Home
         </a>
         <form action="/search" method="get" class="flex flex-col md:flex-row gap-2 w-full md:w-auto" data-role="typeahead-form">
-          <input type="text" name="q" list="shared-typeahead" placeholder="Search lexemes…" class="flex-1 px-3 py-2 rounded border border-slate-300 focus:border-slate-500 focus:ring-2 focus:ring-slate-300" />
+          <div class="relative position-relative flex-1">
+            <input type="text" name="q" data-role="typeahead-input" placeholder="Search lexemes…" class="w-full px-3 py-2 rounded border border-slate-300 focus:border-slate-500 focus:ring-2 focus:ring-slate-300" autocomplete="off" />
+            <div class="typeahead-panel" data-role="typeahead-panel" role="listbox" hidden></div>
+          </div>
           <select name="mode" class="px-3 py-2 rounded border border-slate-300">
             <option value="fuzzy">Fuzzy</option>
             <option value="substring">Substring</option>
           </select>
           <button type="submit" class="inline-flex items-center justify-center rounded-full bg-slate-900 text-white px-4 py-2 font-semibold shadow hover:bg-slate-800 transition">🔍</button>
         </form>
-        <datalist id="shared-typeahead"></datalist>
       </div>
     </header>
-    <script>
-      (function() {
-        const datalist = document.getElementById('shared-typeahead');
-        if (!datalist || !window.fetch) return;
-        const forms = document.querySelectorAll('[data-role="typeahead-form"]');
-        forms.forEach((form) => {
-          const input = form.querySelector('input[name="q"]');
-          if (!input) return;
-          let controller;
-          input.addEventListener('input', async (event) => {
-            const query = event.target.value.trim();
-            if (!query) {
-              datalist.innerHTML = '';
-              return;
-            }
-            if (controller) controller.abort();
-            controller = new AbortController();
-            const url = `/api/typeahead?q=${encodeURIComponent(query)}&limit=10&mode=prefix`;
-            try {
-              const response = await fetch(url, { signal: controller.signal });
-              if (!response.ok) return;
-              const payload = await response.json();
-              datalist.innerHTML = '';
-              (payload.suggestions || []).forEach((item) => {
-                const option = document.createElement('option');
-                option.value = item.word;
-                datalist.appendChild(option);
-              });
-            } catch (_) {
-              // ignore failures
-            }
-          });
-        });
-      })();
-    </script>
-    "#
-    .to_string()
+    {widget}
+    "#,
+        widget = TYPEAHEAD_WIDGET
+    )
 }
 
 
@@ -1503,6 +1616,65 @@ fn pos_chip_class(label: &str) -> &'static str {
         background-color: rgba(15, 23, 42, 0.04);
         border-style: dashed;
       }
+      .overview-grid {
+        align-items: stretch;
+      }
+      .overview-card {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.75rem;
+        padding: 0.65rem 1rem;
+        border-radius: 0.9rem;
+        background-color: #fff;
+        box-shadow: 0 8px 20px rgba(15, 23, 42, 0.08);
+        min-height: 0;
+      }
+      .overview-title {
+        font-size: 0.7rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: #64748b;
+        margin-bottom: 0.15rem;
+      }
+      .overview-detail {
+        font-size: 0.9rem;
+        color: #334155;
+        margin: 0;
+      }
+      .overview-value {
+        font-size: 1.8rem;
+        font-weight: 600;
+        color: #0f172a;
+        margin: 0;
+        white-space: nowrap;
+      }
+      .overview-link {
+        font-size: 0.85rem;
+        font-weight: 600;
+        color: #0f172a;
+        text-decoration: none;
+        padding: 0.3rem 0.75rem;
+        border-radius: 999px;
+        border: 1px solid rgba(15, 23, 42, 0.15);
+      }
+      .overview-link:hover {
+        background-color: rgba(15, 23, 42, 0.08);
+      }
+      .overview-pos-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.3rem;
+        margin: 0;
+        padding: 0;
+      }
+      .overview-pos-chip {
+        font-size: 0.85rem;
+        color: #0f172a;
+        background-color: rgba(15, 23, 42, 0.06);
+        padding: 0.15rem 0.5rem;
+        border-radius: 999px;
+      }
     </style>
     <script type="application/ld+json">
     {{ json_ld }}
@@ -1532,34 +1704,39 @@ fn pos_chip_class(label: &str) -> &'static str {
         </nav>
 
         <section id="overview">
-          <div class="grid gap-4 md:grid-cols-3 row row-cols-1 row-cols-md-3 g-3">
-            <div class="bg-white shadow rounded p-4 card card-body h-100 col">
-              <p class="text-sm uppercase tracking-wide text-slate-500 mb-2">Sense coverage</p>
-              <p class="text-3xl font-bold text-slate-900">{{ sense_count }}</p>
-              <p class="text-sm text-slate-500 mb-0">documented sense{% if sense_count != 1 %}s{% endif %}</p>
+          <div class="grid gap-3 md:grid-cols-3 row row-cols-1 row-cols-md-3 g-2 overview-grid">
+            <div class="overview-card">
+              <div>
+                <p class="overview-title">Sense coverage</p>
+                <p class="overview-detail">documented sense{% if sense_count != 1 %}s{% endif %}</p>
+              </div>
+              <p class="overview-value">{{ sense_count }}</p>
             </div>
-            <div class="bg-white shadow rounded p-4 card card-body h-100 col">
-              <p class="text-sm uppercase tracking-wide text-slate-500 mb-2">Parts of speech</p>
-              {% if payload.pos_frequency.len() > 0 %}
-              <ul class="space-y-1 text-sm text-slate-600 list-unstyled list-none mb-0">
-                {% for pos in payload.pos_frequency %}
-                <li class="flex justify-between d-flex justify-content-between">
-                  <span class="font-semibold">{{ pos.label }}</span>
-                  <span>{{ pos.count }} {% if pos.count == 1 %}sense{% else %}senses{% endif %}</span>
-                </li>
-                {% endfor %}
-              </ul>
-              {% else %}
-              <p class="text-sm text-slate-500 mb-0">Part-of-speech tags not available.</p>
-              {% endif %}
+            <div class="overview-card">
+              <div>
+                <p class="overview-title">Parts of speech</p>
+                {% if payload.pos_frequency.len() > 0 %}
+                <div class="overview-pos-list">
+                  {% for pos in payload.pos_frequency %}
+                  <span class="overview-pos-chip">{{ pos.label }} ({{ pos.count }})</span>
+                  {% endfor %}
+                </div>
+                {% else %}
+                <p class="overview-detail">Part-of-speech tags not available.</p>
+                {% endif %}
+              </div>
             </div>
-            <div class="bg-white shadow rounded p-4 card card-body h-100 col">
-              <p class="text-sm uppercase tracking-wide text-slate-500 mb-2">Encyclopedia</p>
+            <div class="overview-card">
+              <div>
+                <p class="overview-title">Encyclopedia</p>
+                {% if encyclopedia_html.is_some() %}
+                <p class="overview-detail">Includes a long-form article.</p>
+                {% else %}
+                <p class="overview-detail">No encyclopedia article available.</p>
+                {% endif %}
+              </div>
               {% if encyclopedia_html.is_some() %}
-              <p class="text-sm text-slate-600 mb-4">This lexeme includes a long-form encyclopedia entry.</p>
-              <a href='#encyclopedia' class="{{ chrome.button_class }} inline-flex justify-center w-full md:w-auto">Jump to encyclopedia</a>
-              {% else %}
-              <p class="text-sm text-slate-500 mb-0">No encyclopedia article available.</p>
+              <a href='#encyclopedia' class="overview-link">Jump</a>
               {% endif %}
             </div>
           </div>
