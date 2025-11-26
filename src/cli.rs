@@ -69,7 +69,7 @@ enum LexemeCommand {
         #[arg(short, long, default_value_t = 10)]
         limit: usize,
         /// Search mode (fuzzy uses RapidFuzz scoring; substring scans lexeme forms only).
-        #[arg(long, value_enum, default_value_t = SearchMode::Fuzzy)]
+        #[arg(long, value_enum, default_value_t = SearchMode::Substring)]
         mode: SearchMode,
         /// Fields to search; omit to use defaults (word + definitions).
         #[arg(long = "field", value_enum)]

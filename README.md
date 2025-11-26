@@ -73,14 +73,15 @@ cargo run -- lexeme search algorithm --mode substring --limit 15
 
 ### Weighted fuzzy search
 
-`lexeme search` defaults to a RapidFuzz-backed ranking that blends matches across the word,
-definitions, synonyms, entry text, and encyclopedia content. You can toggle fields or adjust their
-weights directly:
+`lexeme search` now defaults to substring matching so the fastest, most literal hits show up without
+tuning. Pass `--mode fuzzy` when you want the RapidFuzz-backed ranking that blends matches across
+the word, definitions, synonyms, entry text, and encyclopedia content. You can toggle fields or
+adjust their weights directly:
 
 ```bash
-# Focus on encyclopedia matches
-cargo run -- lexeme search "gravitation" --field encyclopedia --weight-encyclopedia 3.5
-# Fall back to substring-only matching across lexeme forms
+# Focus on encyclopedia matches (fuzzy mode, weighted toward encyclopedia text)
+cargo run -- lexeme search "gravitation" --mode fuzzy --field encyclopedia --weight-encyclopedia 3.5
+# Stay with substring-only matching across lexeme forms (default)
 cargo run -- lexeme search bio --mode substring
 # Capture per-field contributions and cache stats
 cargo run -- lexeme search tensor --explain --limit 5
