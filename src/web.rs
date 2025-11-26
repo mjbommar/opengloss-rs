@@ -1262,8 +1262,8 @@ fn typeahead_header_html() -> String {
             <div class="typeahead-panel" data-role="typeahead-panel" role="listbox" hidden></div>
           </div>
           <select name="mode" class="px-3 py-2 rounded border border-slate-300">
-            <option value="substring" selected>Substring</option>
-            <option value="fuzzy">Fuzzy</option>
+            <option value="substring" selected>Contains text</option>
+            <option value="fuzzy">Best match</option>
           </select>
           <button type="submit" class="inline-flex items-center justify-center rounded-full bg-slate-900 text-white px-4 py-2 font-semibold shadow hover:bg-slate-800 transition">🔍</button>
         </form>
