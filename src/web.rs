@@ -541,13 +541,25 @@ async fn api_typeahead(
         .unwrap_or(TYPEAHEAD_DEFAULT_LIMIT)
         .clamp(1, TYPEAHEAD_MAX_LIMIT);
     let mode = params.mode.unwrap_or(TypeaheadMode::Prefix);
-    let suggestions = match mode {
+    let mut suggestions = match mode {
         TypeaheadMode::Prefix => LexemeIndex::prefix(query, limit),
         TypeaheadMode::Substring => LexemeIndex::search_contains(query, limit),
+    };
+    if mode == TypeaheadMode::Prefix && suggestions.len() < limit && query.len() >= 3 {
+        let fallback = LexemeIndex::search_contains(query, limit);
+        for (word, lexeme_id) in fallback {
+            if !suggestions.iter().any(|(existing, _)| existing == &word) {
+                suggestions.push((word, lexeme_id));
+                if suggestions.len() >= limit {
+                    break;
+                }
+            }
+        }
     }
-    .into_iter()
-    .map(|(word, lexeme_id)| TypeaheadSuggestion { word, lexeme_id })
-    .collect();
+    let suggestions = suggestions
+        .into_iter()
+        .map(|(word, lexeme_id)| TypeaheadSuggestion { word, lexeme_id })
+        .collect();
     Ok(Json(TypeaheadResponse {
         query: query.to_string(),
         mode,
@@ -623,7 +635,7 @@ struct TypeaheadParams {
     mode: Option<TypeaheadMode>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Copy, Clone)]
+#[derive(Debug, Deserialize, Serialize, Copy, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum TypeaheadMode {
     Prefix,
@@ -1923,6 +1935,30 @@ mod tests {
         let payload: TypeaheadResponse = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(payload.query, "do");
         assert!(!payload.suggestions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_typeahead_prefix_falls_back_to_substring() {
+        let router = test_router();
+        // "object" does not start any lexeme directly but appears in compounds such as "3d object".
+        let response = router
+            .oneshot(
+                Request::get("/api/typeahead?q=object&mode=prefix&limit=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: TypeaheadResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload.query, "object");
+        assert!(
+            !payload.suggestions.is_empty(),
+            "substring fallback should populate suggestions when prefix misses"
+        );
     }
 
     #[tokio::test]
