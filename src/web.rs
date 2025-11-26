@@ -1045,6 +1045,37 @@ fn render_markdown_list(items: &[String]) -> Vec<String> {
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js" integrity="sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI" crossorigin="anonymous"></script>
     {% endif %}
     <link rel="canonical" href="{{ canonical_url }}">
+    <style>
+      .rich-text {
+        line-height: 1.65;
+      }
+      .rich-text p {
+        margin-bottom: 1rem;
+      }
+      .rich-text ul,
+      .rich-text ol {
+        margin-bottom: 1rem;
+        padding-left: 1.5rem;
+      }
+      .rich-text li + li {
+        margin-top: 0.35rem;
+      }
+      .rich-text code {
+        background-color: rgba(15, 23, 42, 0.08);
+        padding: 0.15rem 0.35rem;
+        border-radius: 0.25rem;
+      }
+      .rich-text pre {
+        padding: 0.75rem;
+        border-radius: 0.5rem;
+        background-color: rgba(15, 23, 42, 0.08);
+        overflow-x: auto;
+        margin-bottom: 1rem;
+      }
+      .rich-text > :last-child {
+        margin-bottom: 0;
+      }
+    </style>
     <script type="application/ld+json">
     {{ json_ld }}
     </script>
@@ -1124,7 +1155,7 @@ fn render_markdown_list(items: &[String]) -> Vec<String> {
           <h2 class="text-xl font-semibold mb-2">Definitions</h2>
           <ul class="list-disc pl-6 space-y-1">
             {% for definition in definition_blocks %}
-            <li class="prose prose-slate max-w-none">{{ definition|safe }}</li>
+            <li class="prose prose-slate max-w-none rich-text">{{ definition|safe }}</li>
             {% endfor %}
           </ul>
         </section>
@@ -1141,7 +1172,7 @@ fn render_markdown_list(items: &[String]) -> Vec<String> {
                   • {{ sense.payload.part_of_speech.as_ref().unwrap() }}
                 {% endif %}
               </p>
-              <div class="font-medium mb-2 prose prose-slate max-w-none">
+              <div class="font-medium mb-2 prose prose-slate max-w-none rich-text">
                 {% if sense.definition_html.is_some() %}
                   {{ sense.definition_html.as_ref().unwrap()|safe }}
                 {% else %}
@@ -1189,7 +1220,7 @@ fn render_markdown_list(items: &[String]) -> Vec<String> {
         {% if encyclopedia_html.is_some() %}
         <section id="encyclopedia">
           <h2 class="text-xl font-semibold mb-2">Encyclopedia Entry</h2>
-          <div class="bg-white shadow rounded p-4 prose prose-slate max-w-none">{{ encyclopedia_html.as_ref().unwrap()|safe }}</div>
+          <div class="bg-white shadow rounded p-4 prose prose-slate max-w-none rich-text">{{ encyclopedia_html.as_ref().unwrap()|safe }}</div>
         </section>
         {% endif %}
       </div>
