@@ -47,9 +47,12 @@ tar -tf dist/opengloss-rs-v0.1.0-*.tar.zst | head
    gh release create v0.1.0 \
      dist/opengloss-rs-v0.1.0-*.tar.zst \
      dist/opengloss-rs-v0.1.0-*.tar.zst.sha256 \
-     --notes-file release-notes.md
+     --notes-file notes/release-notes-v0.1.0.md
    ```
 3. Mention the benchmark snapshot and RAM footprint in the release notes.
+
+Release note drafts for each version live under `notes/`; pick the matching `notes/release-notes-vX.Y.Z.md`
+file when creating or editing the GitHub release.
 
 ## 4. Post-release
 
