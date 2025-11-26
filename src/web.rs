@@ -308,8 +308,6 @@ async fn lexeme_html(
             let json_ld =
                 MarkupDisplay::new_safe(lexeme_json_ld(&entry, &state.base_url), HtmlEscaper);
             let encyclopedia_html = render_markdown(payload.encyclopedia_entry.as_deref());
-            let definition_blocks = render_markdown_list(&payload.all_definitions);
-            let has_definitions = !definition_blocks.is_empty();
             let senses = payload
                 .senses
                 .iter()
@@ -325,10 +323,8 @@ async fn lexeme_html(
                 canonical_url: absolute_lexeme_url(&state.base_url, entry.word()),
                 json_ld,
                 encyclopedia_html,
-                definition_blocks,
                 senses,
                 sense_count,
-                has_definitions,
             };
             Html(
                 template
@@ -1022,13 +1018,6 @@ fn render_markdown_str(input: &str) -> Option<String> {
     Some(html)
 }
 
-fn render_markdown_list(items: &[String]) -> Vec<String> {
-    items
-        .iter()
-        .filter_map(|item| render_markdown_str(item))
-        .collect()
-}
-
 #[derive(Template)]
 #[template(
     source = r#"<!DOCTYPE html>
@@ -1094,9 +1083,6 @@ fn render_markdown_list(items: &[String]) -> Vec<String> {
           {% if payload.parts_of_speech.len() > 0 %}
           <a href='#parts-of-speech' class="nav-link px-3 py-1 rounded-full bg-slate-200 hover:bg-slate-300 text-slate-700">Parts of speech</a>
           {% endif %}
-          {% if has_definitions %}
-          <a href='#definitions' class="nav-link px-3 py-1 rounded-full bg-slate-200 hover:bg-slate-300 text-slate-700">Definitions</a>
-          {% endif %}
           {% if sense_count > 0 %}
           <a href='#senses' class="nav-link px-3 py-1 rounded-full bg-slate-200 hover:bg-slate-300 text-slate-700">Senses</a>
           {% endif %}
@@ -1150,17 +1136,6 @@ fn render_markdown_list(items: &[String]) -> Vec<String> {
         </section>
         {% endif %}
 
-        {% if has_definitions %}
-        <section id="definitions">
-          <h2 class="text-xl font-semibold mb-2">Definitions</h2>
-          <ul class="list-disc pl-6 space-y-1">
-            {% for definition in definition_blocks %}
-            <li class="prose prose-slate max-w-none rich-text">{{ definition|safe }}</li>
-            {% endfor %}
-          </ul>
-        </section>
-        {% endif %}
-
         <section id="senses">
           <h2 class="text-xl font-semibold mb-2">Senses ({{ sense_count }})</h2>
           <div class="space-y-4">
@@ -1202,15 +1177,14 @@ fn render_markdown_list(items: &[String]) -> Vec<String> {
               </p>
               {% endif %}
               {% if sense.payload.examples.len() > 0 %}
-              <p><strong>Examples:</strong>
-                {% for example in sense.payload.examples %}
-                  {% if loop.first %}
-                    {{ example }}
-                  {% else %}
-                    • {{ example }}
-                  {% endif %}
-                {% endfor %}
-              </p>
+              <div class="mt-3">
+                <p class="font-semibold mb-1">Examples</p>
+                <ul class="list-disc pl-6 space-y-1">
+                  {% for example in sense.payload.examples %}
+                  <li>{{ example }}</li>
+                  {% endfor %}
+                </ul>
+              </div>
               {% endif %}
             </article>
             {% endfor %}
@@ -1235,10 +1209,8 @@ struct LexemeTemplate<'a> {
     canonical_url: String,
     json_ld: SafeJson,
     encyclopedia_html: Option<String>,
-    definition_blocks: Vec<String>,
     senses: Vec<SenseBlock<'a>>,
     sense_count: usize,
-    has_definitions: bool,
 }
 
 #[derive(Template)]
@@ -1512,7 +1484,7 @@ mod tests {
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("application/ld+json"));
-        assert!(html.contains("<section id=\"definitions\">"));
+        assert!(html.contains("<section id=\"senses\">"));
     }
 
     #[tokio::test]
@@ -1536,8 +1508,8 @@ mod tests {
             "markdown content should render as HTML headings"
         );
         assert!(
-            html.contains("<section id=\"definitions\">"),
-            "definitions section should be present"
+            html.contains("<section id=\"senses\">"),
+            "senses section should be present"
         );
         assert!(
             !html.contains("&lt;h1"),
