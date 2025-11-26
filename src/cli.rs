@@ -13,6 +13,7 @@ use opengloss_rs::{
     FieldContribution, GraphOptions, GraphTraversal, LexemeIndex, RelationKind, SearchBreakdown,
     SearchSummary,
 };
+use rayon::ThreadPoolBuilder;
 use serde_json::json;
 #[cfg(feature = "web")]
 use std::net::SocketAddr;
@@ -30,6 +31,9 @@ pub struct Cli {
     /// Emit JSON instead of human-readable tables.
     #[arg(long, global = true)]
     json: bool,
+    /// Limit the Rayon worker pool (defaults to logical CPU count).
+    #[arg(long, global = true, value_name = "N")]
+    rayon_threads: Option<usize>,
 
     #[command(subcommand)]
     command: Command,
@@ -165,6 +169,7 @@ impl From<ServeTheme> for WebTheme {
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
+    configure_rayon_pool(cli.rayon_threads)?;
     match cli.command {
         Command::Lexeme(LexemeCommand::Get { words }) => handle_get(words, cli.json),
         Command::Lexeme(LexemeCommand::Prefix { prefix, limit }) => {
@@ -971,6 +976,19 @@ fn render_markdown_block(title: &str, body: &str) {
 
 fn user_error(msg: impl Into<String>) -> Box<dyn Error> {
     io::Error::new(io::ErrorKind::InvalidInput, msg.into()).into()
+}
+
+fn configure_rayon_pool(rayon_threads: Option<usize>) -> Result<(), Box<dyn Error>> {
+    if let Some(threads) = rayon_threads {
+        if threads == 0 {
+            return Err(user_error("`--rayon-threads` must be at least 1"));
+        }
+        ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+            .map_err(|err| user_error(format!("failed to configure rayon pool: {err}")))?;
+    }
+    Ok(())
 }
 #[derive(Copy, Clone, Debug, ValueEnum, Eq, PartialEq)]
 enum SearchMode {

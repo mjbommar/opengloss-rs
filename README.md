@@ -36,7 +36,8 @@ If you change the dataset or script output, rebuild to regenerate the embedded s
 The `cli` feature is enabled by default. Build normally (`cargo run -- <args>`) to use the command
 line tooling, or disable it with `cargo build --no-default-features` when you only need the library.
 Every subcommand accepts the global `--json` flag to emit machine-readable output instead of the
-default column/table views.
+default column/table views. Use `--rayon-threads <N>` if you need to cap the background Rayon pool
+for substring/fuzzy searches (otherwise it auto-detects logical CPUs).
 
 ### Quick start
 
