@@ -776,7 +776,7 @@ const TYPEAHEAD_WIDGET: &str = r#"
         }
       };
       input.addEventListener('input', (event) => {
-        const query = event.target.value.trim();
+        const query = event.target.value.trim().toLowerCase();
         if (!query) {
           hidePanel();
           updateStatus('');
@@ -1145,18 +1145,19 @@ async fn api_typeahead(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::bad_request("missing q"))?;
+        .ok_or_else(|| ApiError::bad_request("missing q"))?
+        .to_lowercase();
     let limit = params
         .limit
         .unwrap_or(TYPEAHEAD_DEFAULT_LIMIT)
         .clamp(1, TYPEAHEAD_MAX_LIMIT);
     let mode = params.mode.unwrap_or(TypeaheadMode::Prefix);
     let mut suggestions = match mode {
-        TypeaheadMode::Prefix => LexemeIndex::prefix(query, limit),
-        TypeaheadMode::Substring => LexemeIndex::search_contains(query, limit),
+        TypeaheadMode::Prefix => LexemeIndex::prefix(&query, limit),
+        TypeaheadMode::Substring => LexemeIndex::search_contains(&query, limit),
     };
     if mode == TypeaheadMode::Prefix && suggestions.len() < limit && query.len() >= 3 {
-        let fallback = LexemeIndex::search_contains(query, limit);
+        let fallback = LexemeIndex::search_contains(&query, limit);
         for (word, lexeme_id) in fallback {
             if !suggestions.iter().any(|(existing, _)| existing == &word) {
                 suggestions.push((word, lexeme_id));
@@ -1171,7 +1172,7 @@ async fn api_typeahead(
         .map(|(word, lexeme_id)| TypeaheadSuggestion { word, lexeme_id })
         .collect();
     Ok(Json(TypeaheadResponse {
-        query: query.to_string(),
+        query,
         mode,
         suggestions,
     }))
@@ -2462,34 +2463,37 @@ fn pos_chip_class(label: &str) -> &'static str {
         border-radius: 999px;
       }
       .feedback-row {
-        margin-top: 0.5rem;
-        padding-top: 0.5rem;
+        margin-top: 0.75rem;
+        padding-top: 0.75rem;
         border-top: 1px dashed rgba(15, 23, 42, 0.15);
-        display: flex;
-        flex-direction: column;
-        gap: 0.35rem;
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 0.5rem;
+        align-items: center;
       }
       .feedback-buttons {
         display: inline-flex;
-        gap: 0.4rem;
-        flex-wrap: wrap;
+        gap: 0.25rem;
+        flex-wrap: nowrap;
       }
       .feedback-button {
-        width: 2rem;
-        height: 2rem;
+        width: 0.5rem;
+        height: 0.5rem;
         border-radius: 999px;
-        border: 1px solid rgba(15, 23, 42, 0.25);
-        background: rgba(15, 23, 42, 0.02);
+        border: 1px solid rgba(15, 23, 42, 0.2);
+        background: rgba(15, 23, 42, 0.03);
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        font-size: 0.95rem;
+        font-size: 0.5rem;
         cursor: pointer;
-        transition: border-color 120ms ease, background-color 120ms ease;
+        transition: border-color 120ms ease, background-color 120ms ease, transform 120ms ease;
+        padding: 0.4rem;
       }
       .feedback-button:hover {
-        border-color: rgba(15, 23, 42, 0.45);
-        background-color: rgba(15, 23, 42, 0.06);
+        border-color: rgba(15, 23, 42, 0.4);
+        background-color: rgba(15, 23, 42, 0.08);
+        transform: scale(1.15);
       }
       .confidence-pill {
         display: inline-flex;
@@ -2632,17 +2636,17 @@ fn pos_chip_class(label: &str) -> &'static str {
         {% endif %}
 
         <section id="senses">
-          <h2 class="text-xl font-semibold mb-2">Senses ({{ sense_count }})</h2>
-          <div class="space-y-4">
+          <h2 class="text-xl font-semibold mb-3">Senses ({{ sense_count }})</h2>
+          <div class="space-y-5">
             {% for sense in senses %}
-            <article class="bg-white shadow rounded p-4">
-              <p class="text-sm text-slate-500 mb-1">
+            <article class="bg-white shadow rounded p-5">
+              <p class="text-sm text-slate-500 mb-2">
                 Sense #{{ sense.payload.sense_index }}
                 {% if sense.payload.part_of_speech.is_some() %}
                   • {{ sense.payload.part_of_speech.as_ref().unwrap() }}
                 {% endif %}
               </p>
-              <div class="font-medium mb-2 prose prose-slate max-w-none rich-text">
+              <div class="font-semibold mb-3 prose prose-slate max-w-none rich-text" style="font-size: 1.05rem; line-height: 1.6; color: #0f172a;">
                 {% if sense.definition_html.is_some() %}
                   {{ sense.definition_html.as_ref().unwrap()|safe }}
                 {% else %}
@@ -2650,20 +2654,23 @@ fn pos_chip_class(label: &str) -> &'static str {
                 {% endif %}
               </div>
               <div class="feedback-row" data-feedback-target data-feedback-kind="sense-definition" data-lexeme-id="{{ payload.lexeme_id }}" data-sense-index="{{ sense.payload.sense_index }}">
-                <p class="text-xs uppercase tracking-wide text-slate-500">Was this definition helpful?</p>
+                <div>
+                  <p class="text-xs text-slate-400" style="font-size: 0.7rem;">Was this definition helpful?
+                  {% if sense.definition_confidence.is_some() %}
+                    <span class="confidence-pill ml-2">{{ sense.definition_confidence.as_ref().unwrap() }}</span>
+                  {% endif %}
+                  </p>
+                  <p class="text-xs text-slate-500 feedback-status" data-feedback-status></p>
+                </div>
                 <div class="feedback-buttons">
                   <button type="button" class="feedback-button" data-feedback-vote="up" aria-label="Mark this definition helpful" title="Mark this definition helpful">👍</button>
                   <button type="button" class="feedback-button" data-feedback-vote="down" aria-label="Flag this definition" title="Flag this definition">👎</button>
                 </div>
-                {% if sense.definition_confidence.is_some() %}
-                <span class="confidence-pill">{{ sense.definition_confidence.as_ref().unwrap() }}</span>
-                {% endif %}
-                <p class="text-xs text-slate-500 feedback-status" data-feedback-status></p>
               </div>
               {% for group in sense.relation_groups %}
-              <div class="mt-3">
+              <div class="mt-4">
                 <div class="d-flex flex-column flex-md-row justify-content-between align-items-center gap-2">
-                  <p class="font-semibold mb-0">{{ group.title }}</p>
+                  <p class="font-semibold mb-0" style="font-size: 0.95rem; color: #1e293b;">{{ group.title }}</p>
                   {% if group.confidence.is_some() %}
                   <span class="confidence-pill">{{ group.confidence.as_ref().unwrap() }}</span>
                   {% endif %}
@@ -2678,21 +2685,23 @@ fn pos_chip_class(label: &str) -> &'static str {
                   {% endfor %}
                 </div>
                 <div class="feedback-row" data-feedback-target data-feedback-kind="sense-relations" data-lexeme-id="{{ payload.lexeme_id }}" data-sense-index="{{ sense.payload.sense_index }}" data-relation-kind="{{ group.kind.label() }}">
-                  <p class="text-xs uppercase tracking-wide text-slate-500">Are these {{ group.title_lower }} useful?</p>
+                  <div>
+                    <p class="text-xs text-slate-400" style="font-size: 0.7rem;">Are these {{ group.title_lower }} useful?</p>
+                    <p class="text-xs text-slate-500 feedback-status" data-feedback-status></p>
+                  </div>
                   <div class="feedback-buttons">
                     <button type="button" class="feedback-button" data-feedback-vote="up" aria-label="Mark these relations helpful" title="Mark these relations helpful">👍</button>
                     <button type="button" class="feedback-button" data-feedback-vote="down" aria-label="Flag these relations" title="Flag these relations">👎</button>
                   </div>
-                  <p class="text-xs text-slate-500 feedback-status" data-feedback-status></p>
                 </div>
               </div>
               {% endfor %}
               {% if sense.payload.examples.len() > 0 %}
-              <div class="mt-3">
-                <p class="font-semibold mb-1">Examples</p>
-                <ul class="list-disc pl-6 space-y-1">
+              <div class="mt-4">
+                <p class="font-semibold mb-2" style="font-size: 0.95rem; color: #1e293b;">Examples</p>
+                <ul class="list-disc pl-6 space-y-1.5">
                   {% for example in sense.payload.examples %}
-                  <li>{{ example }}</li>
+                  <li class="text-slate-700">{{ example }}</li>
                   {% endfor %}
                 </ul>
               </div>
@@ -2746,15 +2755,18 @@ fn pos_chip_class(label: &str) -> &'static str {
           <h2 class="text-xl font-semibold mb-2">Encyclopedia Entry</h2>
           <div class="bg-white shadow rounded p-4 prose prose-slate max-w-none rich-text">{{ encyclopedia_html.as_ref().unwrap()|safe }}</div>
           <div class="feedback-row" data-feedback-target data-feedback-kind="encyclopedia" data-lexeme-id="{{ payload.lexeme_id }}">
-            <p class="text-xs uppercase tracking-wide text-slate-500">Is this article helpful?</p>
+            <div>
+              <p class="text-xs text-slate-400" style="font-size: 0.7rem;">Is this article helpful?
+              {% if encyclopedia_confidence.is_some() %}
+                <span class="confidence-pill ml-2">{{ encyclopedia_confidence.as_ref().unwrap() }}</span>
+              {% endif %}
+              </p>
+              <p class="text-xs text-slate-500 feedback-status" data-feedback-status></p>
+            </div>
             <div class="feedback-buttons">
               <button type="button" class="feedback-button" data-feedback-vote="up" aria-label="Mark this article helpful" title="Mark this article helpful">👍</button>
               <button type="button" class="feedback-button" data-feedback-vote="down" aria-label="Flag this article" title="Flag this article">👎</button>
             </div>
-            {% if encyclopedia_confidence.is_some() %}
-            <span class="confidence-pill">{{ encyclopedia_confidence.as_ref().unwrap() }}</span>
-            {% endif %}
-            <p class="text-xs text-slate-500 feedback-status" data-feedback-status></p>
           </div>
         </section>
         {% endif %}
