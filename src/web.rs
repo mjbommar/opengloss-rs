@@ -4,8 +4,7 @@ use crate::telemetry::{
     describe_ratio, generate_session_id,
 };
 use crate::{LexemeEntry, LexemeIndex, RelationKind, SearchConfig};
-use askama::Html as HtmlEscaper;
-use askama::{MarkupDisplay, Template};
+use askama::Template;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -40,9 +39,6 @@ const SITEMAP_BUCKETS: [&str; 27] = [
 const TYPEAHEAD_DEFAULT_LIMIT: usize = 12;
 const TYPEAHEAD_MAX_LIMIT: usize = 50;
 const SESSION_COOKIE: &str = "opengloss_session";
-type SafeMarkup = MarkupDisplay<HtmlEscaper, String>;
-type SafeJson = SafeMarkup;
-
 struct SessionHandle {
     id: String,
     needs_set: bool,
@@ -152,6 +148,74 @@ impl Chrome {
             },
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct FooterLink {
+    label: &'static str,
+    href: &'static str,
+}
+
+const FOOTER_LINKS: &[FooterLink] = &[
+    FooterLink {
+        label: "ArXiv paper",
+        href: "https://www.arxiv.org/abs/2511.18622",
+    },
+    FooterLink {
+        label: "GitHub repo",
+        href: "https://github.com/mjbommar/opengloss-rs",
+    },
+    FooterLink {
+        label: "Hugging Face dataset",
+        href: "https://huggingface.co/datasets/mjbommar/opengloss-dictionary",
+    },
+];
+
+fn shared_footer_html(chrome: &Chrome) -> String {
+    let (container_class, description_class, detail_class, links_class, link_class) =
+        if chrome.use_tailwind {
+            (
+                "mt-12 text-center text-sm text-slate-500 space-y-3",
+                "text-slate-600",
+                "text-xs text-slate-500",
+                "flex flex-wrap items-center justify-center gap-3 text-sm text-slate-600",
+                "text-slate-700 underline hover:text-slate-900",
+            )
+        } else {
+            (
+                "mt-5 text-center text-muted small",
+                "text-muted",
+                "text-muted",
+                "d-flex flex-wrap justify-content-center gap-3 small",
+                "link-secondary",
+            )
+        };
+    let links = FOOTER_LINKS
+        .iter()
+        .map(|link| {
+            format!(
+                r#"<a class="{link_class}" href="{href}" target="_blank" rel="noopener noreferrer">{label}</a>"#,
+                link_class = link_class,
+                href = link.href,
+                label = link.label,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n        ");
+    format!(
+        r#"<footer class="{container_class}">
+        <p class="{description_class}">Use the CLI or JSON API for bulk lookups—commands live in the README.</p>
+        <p class="{detail_class}">Key resources:</p>
+        <div class="{links_class}">
+        {links}
+        </div>
+      </footer>"#,
+        container_class = container_class,
+        description_class = description_class,
+        detail_class = detail_class,
+        links_class = links_class,
+        links = links,
+    )
 }
 
 #[derive(Clone)]
@@ -359,6 +423,7 @@ fn render_home(
         format!(r#"<div class="rounded bg-slate-50 px-3 py-2">{streak_note}</div>"#)
     };
     let search_section = render_search_card(&chrome, intro, &streak_badge);
+    let footer_html = shared_footer_html(&chrome);
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -380,16 +445,7 @@ fn render_home(
         {challenge_section}
         {trending_section}
       </div>
-      <footer class="mt-12 text-center text-sm text-slate-500 space-y-2">
-        <p>Need the nerdy knobs? Run the bundled CLI or call the JSON API for batch lookups—see the README for commands and endpoints.</p>
-        <p class="text-xs">Type-ahead suggestions come directly from the offline trie baked into the Rust binary. Advanced clients can hit <code>/api/typeahead</code>, <code>/api/search</code>, or <code>/api/lexeme</code> for richer automation.</p>
-        <p>
-          Learn why we built OpenGloss in
-          <a href="https://www.arxiv.org/abs/2511.18622" class="text-slate-700 underline hover:text-slate-900" target="_blank" rel="noopener noreferrer">
-            “OpenGloss: A Synthetic Encyclopedic Dictionary and Semantic Knowledge Graph”
-          </a>.
-        </p>
-      </footer>
+      {footer_html}
     </main>
     {typeahead_script}
   </body>
@@ -404,6 +460,7 @@ fn render_home(
         highlight_section = highlight_section,
         challenge_section = challenge_section,
         trending_section = trending_section,
+        footer_html = footer_html,
     )
 }
 
@@ -929,8 +986,8 @@ async fn lexeme_html_inner(
         Ok(entry) => {
             let chrome = Chrome::new(state.theme);
             let payload = LexemePayload::from_entry(&entry);
-            let json_ld =
-                MarkupDisplay::new_safe(lexeme_json_ld(&entry, &state.base_url), HtmlEscaper);
+            let json_ld = lexeme_json_ld(&entry, &state.base_url);
+            let footer_html = shared_footer_html(&chrome);
             let encyclopedia_html = render_markdown(payload.encyclopedia_entry.as_deref());
             let pos_chips = payload
                 .parts_of_speech
@@ -979,6 +1036,7 @@ async fn lexeme_html_inner(
                 encyclopedia_confidence,
                 relation_heatmap,
                 feedback_script: FEEDBACK_WIDGET,
+                footer_html,
             };
             Html(
                 template
@@ -1005,15 +1063,14 @@ async fn search_html(
                 SearchModeParam::Substring => SearchResponsePayload::substring(&query, limit),
             };
             let chrome = Chrome::new(state.theme);
-            let json_ld = MarkupDisplay::new_safe(
-                search_page_json_ld(&payload, &state.base_url),
-                HtmlEscaper,
-            );
+            let json_ld = search_page_json_ld(&payload, &state.base_url);
+            let footer_html = shared_footer_html(&chrome);
             let template = SearchTemplate {
                 chrome,
                 payload: &payload,
                 json_ld,
                 typeahead_header: typeahead_header_html(),
+                footer_html,
             };
             let html = template
                 .render()
@@ -1045,13 +1102,15 @@ async fn prefix_index_html(
     let mut payload = build_index_payload(LexemeIndex::all_words(), letters, &normalized);
     payload.prefix = display_prefix;
     let chrome = Chrome::new(state.theme);
-    let json_ld = MarkupDisplay::new_safe(defined_term_set_json_ld(&state.base_url), HtmlEscaper);
+    let json_ld = defined_term_set_json_ld(&state.base_url);
+    let footer_html = shared_footer_html(&chrome);
     let template = IndexTemplate {
         chrome,
         payload: &payload,
         json_ld,
         base_url: &state.base_url,
         typeahead_header: typeahead_header_html(),
+        footer_html,
     };
     let html = template
         .render()
@@ -1653,6 +1712,7 @@ fn render_error_page(theme: WebTheme, message: impl Into<String>) -> String {
         ),
     };
     let message = message.into();
+    let footer_html = shared_footer_html(&chrome);
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -1670,6 +1730,7 @@ fn render_error_page(theme: WebTheme, message: impl Into<String>) -> String {
         <p class="{lede_class}">{message}</p>
         <a href="/" class="{button_class}">Back to home</a>
       </div>
+      {footer_html}
     </main>
   </body>
 </html>"#,
@@ -1682,6 +1743,7 @@ fn render_error_page(theme: WebTheme, message: impl Into<String>) -> String {
         lede_class = chrome.lede_class,
         button_class = chrome.button_class,
         message = message,
+        footer_html = footer_html,
     )
 }
 
@@ -2480,7 +2542,7 @@ fn pos_chip_class(label: &str) -> &'static str {
       }
     </style>
     <script type="application/ld+json">
-    {{ json_ld }}
+    {{ json_ld|safe }}
     </script>
   </head>
   <body class="{{ chrome.body_class }}">
@@ -2697,6 +2759,7 @@ fn pos_chip_class(label: &str) -> &'static str {
         </section>
         {% endif %}
       </div>
+      {{ footer_html|safe }}
     </main>
     {{ feedback_script|safe }}
   </body>
@@ -2707,7 +2770,7 @@ struct LexemeTemplate<'a> {
     chrome: Chrome,
     payload: &'a LexemePayload,
     canonical_url: String,
-    json_ld: SafeJson,
+    json_ld: String,
     encyclopedia_html: Option<String>,
     pos_chips: Vec<PosChip<'a>>,
     senses: Vec<SenseBlock<'a>>,
@@ -2717,6 +2780,7 @@ struct LexemeTemplate<'a> {
     encyclopedia_confidence: Option<String>,
     relation_heatmap: Vec<RelationHeatmapRow>,
     feedback_script: &'static str,
+    footer_html: String,
 }
 
 #[derive(Template)]
@@ -2735,7 +2799,7 @@ struct LexemeTemplate<'a> {
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js" integrity="sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI" crossorigin="anonymous"></script>
     {% endif %}
     <script type="application/ld+json">
-    {{ json_ld }}
+    {{ json_ld|safe }}
     </script>
   </head>
   <body class="{{ chrome.body_class }}">
@@ -2780,6 +2844,7 @@ struct LexemeTemplate<'a> {
         </div>
         {% endif %}
       </div>
+      {{ footer_html|safe }}
     </main>
   </body>
 </html>"#,
@@ -2788,8 +2853,9 @@ struct LexemeTemplate<'a> {
 struct SearchTemplate<'a> {
     chrome: Chrome,
     payload: &'a SearchResponsePayload,
-    json_ld: SafeJson,
+    json_ld: String,
     typeahead_header: String,
+    footer_html: String,
 }
 
 #[derive(Template)]
@@ -2809,7 +2875,7 @@ struct SearchTemplate<'a> {
     {% endif %}
     <link rel="canonical" href="{{ base_url }}/index">
     <script type="application/ld+json">
-    {{ json_ld }}
+    {{ json_ld|safe }}
     </script>
   </head>
   <body class="{{ chrome.body_class }}">
@@ -2854,6 +2920,7 @@ struct SearchTemplate<'a> {
           {% endif %}
         </section>
       </div>
+      {{ footer_html|safe }}
     </main>
   </body>
 </html>"#,
@@ -2862,9 +2929,10 @@ struct SearchTemplate<'a> {
 struct IndexTemplate<'a> {
     chrome: Chrome,
     payload: &'a IndexPagePayload<'a>,
-    json_ld: SafeJson,
+    json_ld: String,
     base_url: &'a str,
     typeahead_header: String,
+    footer_html: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Default)]
@@ -2911,6 +2979,12 @@ mod tests {
             telemetry: Telemetry::ephemeral(),
         });
         build_router(state, false)
+    }
+
+    fn extract_json_ld_block(html: &str) -> Option<&str> {
+        let marker = r#"<script type="application/ld+json">"#;
+        let after = html.split(marker).nth(1)?;
+        after.split("</script>").next()
     }
 
     #[tokio::test]
@@ -3059,6 +3133,36 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("application/ld+json"));
         assert!(html.contains("<section id=\"senses\">"));
+    }
+
+    #[tokio::test]
+    async fn lexeme_json_ld_renders_raw_quotes() {
+        let router = test_router();
+        let response = router
+            .oneshot(
+                Request::get("/lexeme?word=dog")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        let block = extract_json_ld_block(&html).expect("json-ld script tag");
+        let json_text = block.trim();
+        assert!(
+            json_text.starts_with('{') || json_text.starts_with('['),
+            "JSON-LD must start with an object or array: {json_text}"
+        );
+        serde_json::from_str::<serde_json::Value>(json_text)
+            .expect("JSON-LD script should be valid JSON");
+        assert!(
+            !json_text.contains("&quot;"),
+            "JSON-LD must not HTML-escape quotes: {json_text}"
+        );
     }
 
     #[tokio::test]

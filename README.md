@@ -5,6 +5,11 @@ dictionary dataset in Rust. The crate builds a static finite-state transducer fo
 and embeds the full entry metadata (definitions, relations, encyclopedia text) directly inside the
 binary.
 
+## What's new (v0.4.2)
+
+- JSON-LD blocks in the web explorer now render with literal quotes, fixing the SEO regressions we spotted in 0.4.1.
+- Every page footer links directly to the ArXiv paper, GitHub repo, and Hugging Face dataset so readers can cite or download resources faster.
+
 ## Prerequisites
 
 - Rust 1.82+ (edition 2024 project).
