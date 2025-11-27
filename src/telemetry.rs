@@ -175,7 +175,7 @@ impl Telemetry {
                 continue;
             }
             if let Some(card) = build_challenge(&traversal) {
-                if card.hop_count > 1 {
+                if card.hop_count > 1 && challenge_is_noun_only(&card) {
                     return Some(card);
                 }
             }
@@ -851,16 +851,61 @@ fn build_relation_puzzle(entry: &LexemeEntry<'_>) -> Option<RelationPuzzle> {
     if synonyms.len() < 2 {
         return None;
     }
+    let source_word = entry.word();
+    let filtered: Vec<_> = synonyms
+        .into_iter()
+        .filter(|syn| is_valid_puzzle_answer(source_word, syn))
+        .collect();
+    if filtered.is_empty() {
+        return None;
+    }
     let mut rng = thread_rng();
-    let answer = synonyms[rng.gen_range(0..synonyms.len())].to_string();
+    let answer = filtered[rng.gen_range(0..filtered.len())]
+        .trim()
+        .to_string();
     let prefix: String = answer.chars().take(5).collect();
     Some(RelationPuzzle {
         lexeme_id: entry.lexeme_id(),
-        word: entry.word().to_string(),
+        word: source_word.to_string(),
         relation: RelationKind::Synonym,
         clue: format!("Starts with \"{}\"", prefix),
         answer,
     })
+}
+
+fn is_valid_puzzle_answer(source: &str, candidate: &str) -> bool {
+    let source = source.trim();
+    let candidate = candidate.trim();
+    if source.is_empty() || candidate.is_empty() {
+        return false;
+    }
+    let source_lower = source.to_lowercase();
+    let candidate_lower = candidate.to_lowercase();
+    if candidate_lower == source_lower {
+        return false;
+    }
+    if candidate_lower.contains(&source_lower) {
+        return false;
+    }
+    let prefix: String = source_lower.chars().take(3).collect();
+    if !prefix.is_empty() && candidate_lower.starts_with(&prefix) {
+        return false;
+    }
+    true
+}
+
+fn challenge_is_noun_only(card: &ChallengeCard) -> bool {
+    card.path.iter().all(|step| lexeme_is_noun(step.lexeme_id))
+}
+
+fn lexeme_is_noun(lexeme_id: u32) -> bool {
+    LexemeIndex::entry_by_id(lexeme_id)
+        .map(|entry| {
+            entry
+                .parts_of_speech()
+                .any(|pos| pos.eq_ignore_ascii_case("noun"))
+        })
+        .unwrap_or(false)
 }
 
 fn snippet(text: &str, max_chars: usize) -> String {
